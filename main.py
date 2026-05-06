@@ -126,7 +126,8 @@ def _tg_create_invite(order_id: str) -> str:
         "member_limit": 1,
         "name": f"order-{order_id}"[:32],  # Telegram name limit
     }
-    resp = _post_with_retry(url, json=body, timeout=10)
+    # Telegram API нестабилен с RU-IP (RKN-«рябь»). 5 попыток за ~30 секунд.
+    resp = _post_with_retry(url, json=body, timeout=10, attempts=5, base_delay=1.0)
     log.info("Telegram createChatInviteLink: %d %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
     data = resp.json()
@@ -298,16 +299,19 @@ def payment_callback():
         invite_link = _tg_create_invite(order_id)
     except Exception as exc:
         log.exception("Telegram createChatInviteLink failed: %s", exc)
-        # Roll back idempotency so we can retry on next callback.
+        # Откатываем дедуп — иначе при ретрае GPL получит skipped:duplicate.
         with _processed_lock:
             _processed.discard(order_id)
-        return jsonify({"ok": False, "error": "telegram"}), 200
+        # 503 → GPL сам повторит колбэк через свой backoff.
+        return jsonify({"ok": False, "error": "telegram", "retry": True}), 503
 
     try:
         _us_send_email(email, invite_link)
     except Exception as exc:
         log.exception("UniSender sendEmail failed: %s", exc)
-        return jsonify({"ok": False, "error": "unisender", "invite": invite_link}), 200
+        with _processed_lock:
+            _processed.discard(order_id)
+        return jsonify({"ok": False, "error": "unisender", "retry": True}), 503
 
     log.info("OK: order=%s email=%s", order_id, email)
     return jsonify({"ok": True}), 200
