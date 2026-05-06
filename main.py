@@ -182,9 +182,10 @@ def _email_template(invite_link: str) -> str:
 
 
 def _extract_email(body: dict) -> str | None:
-    """Try several plausible field names — exact GPL callback shape unknown until first real call."""
+    """GPL puts email in clientInfo.email. Other keys are belt-and-suspenders for any future change."""
     return (
-        body.get("email")
+        (body.get("clientInfo") or {}).get("email")
+        or body.get("email")
         or body.get("customerEmail")
         or body.get("client_email")
         or body.get("payerEmail")
@@ -195,14 +196,28 @@ def _extract_email(body: dict) -> str | None:
 
 
 def _extract_order_id(body: dict, raw: str) -> str:
+    """GPL primary identifier is dealId. mdOrder is GPL-internal, kept as fallback."""
     return str(
-        body.get("id")
+        body.get("dealId")
+        or (body.get("paymentData") or {}).get("mdOrder")
+        or body.get("id")
         or body.get("orderId")
         or body.get("paymentId")
         or body.get("order_id")
         or body.get("transactionId")
         or hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
     )
+
+
+def _is_successful(body: dict, raw_haystack: str) -> bool:
+    """GPL signals success via isSuccess: true (boolean). Other shapes are kept as fallbacks."""
+    if body.get("isSuccess") is True:
+        return True
+    if body.get("status") in {"success", "paid", "completed", "paymentStatusSuccess"}:
+        return True
+    if "paymentstatussuccess" in raw_haystack:
+        return True
+    return False
 
 
 # ─────────────────────────── routes ───────────────────────────
@@ -242,12 +257,7 @@ def payment_callback():
     log.info("Callback parsed: %s", json.dumps(body, ensure_ascii=False)[:1000])
 
     raw_haystack = (raw + json.dumps(body, ensure_ascii=False)).lower()
-    if "paymentstatussuccess" not in raw_haystack and body.get("status") not in {
-        "success",
-        "paid",
-        "completed",
-        "paymentStatusSuccess",
-    }:
+    if not _is_successful(body, raw_haystack):
         log.info("Callback not a success status — ignoring")
         return jsonify({"ok": True, "skipped": "not_success"}), 200
 
