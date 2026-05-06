@@ -57,15 +57,17 @@ def _gpl_init_payment(server_base_url: str) -> str | None:
     """Call GetPlatinum init-payment-url. Returns formUrl or None."""
     deal_id = uuid.uuid4().hex
     client_id = uuid.uuid4().hex
+    # GetPlatinum принимает суммы в копейках.
+    amount_kopecks = PRODUCT_PRICE * 100
     payload = {
         "dealId": deal_id,
         "currency": "RUB",
-        "amount": PRODUCT_PRICE,
+        "amount": amount_kopecks,
         "positions": [
             {
                 "prefix": 12,
                 "name": PRODUCT_NAME,
-                "price": PRODUCT_PRICE,
+                "price": amount_kopecks,
                 "quantity": 1,
                 "vat": "none",
             }
