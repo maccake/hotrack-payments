@@ -388,6 +388,12 @@ def create_payment_for(slug: str):
     except Exception as exc:
         log.exception("Failed to record order %s in DB: %s", deal_id, exc)
         # Не валим оплату из-за БД — fallback по customParams.product сработает.
+    _tg_notify_admin(
+        f"🟡 <b>Клик «{html.escape(product['name'])}»</b>\n"
+        f"IP: <code>{html.escape(ip or '-')}</code>\n"
+        f"Сумма: {product['price_rub']} ₽\n"
+        f"Источник: {html.escape(referer or '-')}"
+    )
     return redirect(form_url, code=302)
 
 
@@ -465,6 +471,11 @@ def payment_callback():
     log.info(
         "BUYER: order=%s product=%s email=%s phone=%s amount_rub=%s invite=%s",
         order_id, slug, email, phone, amount_rub, invite_link,
+    )
+    _tg_notify_admin(
+        f"✅ <b>Оплата «{html.escape(product['name'])}»</b>\n"
+        f"{html.escape(email)}\n"
+        f"{amount_rub} ₽" + (f"\n📞 {html.escape(phone)}" if phone else "")
     )
     return jsonify({"ok": True}), 200
 
