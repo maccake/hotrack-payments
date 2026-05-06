@@ -11,3 +11,8 @@ data/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Internal docs — никогда не должны попасть в публичный репо
+SECURITY-CHECKLIST.md
+PAYMENT-SERVER-DOCS.md
+OPERATIONS.md
