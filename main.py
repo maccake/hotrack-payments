@@ -209,6 +209,13 @@ def _extract_order_id(body: dict, raw: str) -> str:
 
 @app.route("/create-payment", methods=["GET"])
 def create_payment():
+    # Лог конклюдентного согласия — IP, UA, время. Сшивается с email из callback по близкому таймстампу.
+    log.info(
+        "CONSENT: ip=%s ua=%s referer=%s",
+        request.headers.get("X-Forwarded-For", request.remote_addr),
+        request.headers.get("User-Agent", ""),
+        request.headers.get("Referer", ""),
+    )
     # Behind TimeWeb's reverse proxy, request.host_url respects X-Forwarded-* headers
     # (see ProxyFix above), so this is always the public https://... origin.
     try:
