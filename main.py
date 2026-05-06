@@ -13,6 +13,7 @@ Persistent state в SQLite (/app/data/orders.db):
   Для долгосрочного бэкапа покупатели дополнительно пишутся в лог как BUYER:... (TimeWeb хранит логи).
 """
 import hashlib
+import html
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, abort, jsonify, redirect, request
@@ -349,6 +351,12 @@ def create_payment_for(slug: str):
     if not form_url:
         log.error("create-payment(%s): no formUrl in GPL response", slug)
         return redirect(product["fail_url"], code=302)
+    # Защита от open-redirect: form_url ДОЛЖЕН быть https://*.getplatinum.ru.
+    # Если GPL когда-то взломан и вернёт чужой URL — мы его не проксируем.
+    parsed = urlparse(form_url)
+    if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".getplatinum.ru"):
+        log.error("create-payment(%s): suspicious formUrl %s — refusing redirect", slug, form_url)
+        return redirect(product["fail_url"], code=302)
     # Запишем заказ в БД до редиректа — чтобы на колбэке знать, какой это продукт.
     try:
         with _db() as conn:
@@ -370,8 +378,9 @@ def create_payment_default():
 
 @app.route("/payment-callback", methods=["POST"])
 def payment_callback():
+    callback_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     raw = request.get_data(as_text=True)
-    log.info("Callback raw body: %s", raw[:2000])
+    log.info("Callback from ip=%s body: %s", callback_ip, raw[:2000])
 
     body = request.get_json(silent=True) or {}
     if not body:
