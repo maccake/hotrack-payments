@@ -48,7 +48,7 @@ DB_PATH = Path(os.environ.get("DATA_DIR", "/app/data")) / "orders.db"
 PRODUCTS = {
     "hotrack": {
         "name": os.environ.get("PRODUCT_NAME", "Горячий След"),
-        "price_rub": int(os.environ.get("PRODUCT_PRICE", "3790")),
+        "price_rub": int(os.environ.get("PRODUCT_PRICE", "3")),  # TEMP: smoke-test price
         "tg_channel_id": int(os.environ["TG_CHANNEL_ID"]),
         "unisender_list_id": os.environ["UNISENDER_LIST_ID"],
         "success_url": os.environ.get("SUCCESS_URL", "https://gumirovbros.ru/spasibohottrail"),
