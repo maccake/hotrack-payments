@@ -330,7 +330,9 @@ def _resolve_product(deal_id: str, body: dict) -> tuple[str, dict] | tuple[None,
 # ─────────────────────────── routes ───────────────────────────
 
 @app.route("/p/<slug>/create-payment", methods=["GET"])
-@limiter.limit("10 per minute")  # анти-троль: один IP не больше 10 заказов в минуту
+# Лимит на воркер: 2 воркера × 3/мин = ~6/мин эффективно с одного IP (in-memory storage не шарится между воркерами).
+# Реальному пользователю хватает одного клика; защищает от флуда фейковых заказов в GPL.
+@limiter.limit("3 per minute")
 def create_payment_for(slug: str):
     if slug not in PRODUCTS:
         abort(404)
