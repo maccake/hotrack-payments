@@ -33,7 +33,7 @@ SUCCESS_URL = os.environ["SUCCESS_URL"]
 FAIL_URL = os.environ["FAIL_URL"]
 
 PRODUCT_NAME = os.environ.get("PRODUCT_NAME", "Горячий След")
-PRODUCT_PRICE = int(os.environ.get("PRODUCT_PRICE", "3790"))
+PRODUCT_PRICE = int(os.environ.get("PRODUCT_PRICE", "3"))  # TEMP: smoke-test price
 
 # ─────────────────────────── app ──────────────────────────────
 
