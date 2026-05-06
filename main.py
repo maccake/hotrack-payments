@@ -191,7 +191,7 @@ def _email_template(invite_link: str) -> str:
           </p>
           <hr style="border:none;border-top:1px solid #DDD;margin:32px 0;">
           <p style="margin:0;font-size:12px;color:#999;text-align:center;">
-            Если что-то не сработало — <a href="https://t.me/savelygumirov" style="color:#999;">напиши нам в Telegram</a>.<br>
+            Если что-то не сработало — <a href="https://t.me/yaroslavgumirov" style="color:#999;">напиши нам в Telegram</a>.<br>
             — Братья Гумировы
           </p>
         </td></tr>
