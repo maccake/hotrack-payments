@@ -42,6 +42,10 @@ UNISENDER_SENDER_EMAIL = os.environ["UNISENDER_SENDER_EMAIL"]
 SUPPORT_TG = "https://t.me/gumirovyaroslav"
 DB_PATH = Path(os.environ.get("DATA_DIR", "/app/data")) / "orders.db"
 
+# Опциональные — для админ-нотификаций и /stats. Если не заданы — функционал просто выключен.
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # numeric id приватного канала/группы куда слать сводку
+STATS_TOKEN = os.environ.get("STATS_TOKEN")      # секрет в URL для просмотра статистики
+
 # ─────────────────────────── PRODUCTS REGISTRY ───────────────────────────
 # Чтобы добавить продукт: новый ключ в PRODUCTS, обновить кнопку в Tilda на /p/<slug>/create-payment.
 # TG-канал: добавь бота админом, дай ему «Создание пригласительных ссылок».
@@ -150,6 +154,23 @@ def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
                 log.warning("POST %s transient error (%s), retry %d/%d in %.1fs", url, exc, i + 1, attempts - 1, delay)
                 time.sleep(delay)
     raise last_exc
+
+
+# ─────────────────────────── admin notifications (best-effort) ───────────────────────────
+
+def _tg_notify_admin(text: str) -> None:
+    """Отправить сообщение в админ-канал. НИКОГДА не должна валить основной флоу."""
+    if not ADMIN_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+        requests.post(
+            url,
+            json={"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=5,
+        )
+    except Exception:
+        log.exception("Admin notify failed (non-critical)")
 
 
 # ─────────────────────────── domain ops ───────────────────────────
