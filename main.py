@@ -1,65 +1,142 @@
 """
-Горячий След — payment middleware.
+Payment middleware: Tilda → GetPlatinum → Telegram invite + UniSender email.
 
-Two endpoints:
-  GET  /create-payment    — called by Tilda button. Creates payment in GetPlatinum, redirects to checkout.
-  POST /payment-callback  — called by GetPlatinum on successful payment. Issues Telegram invite + email.
+Multi-product:
+  PRODUCTS dict ниже — единственное место добавления нового продукта.
+  Каждый продукт имеет свой URL: /p/<slug>/create-payment
+  /create-payment без слага — алиас на дефолтный продукт (hotrack), для совместимости с уже опубликованной кнопкой.
 
-All secrets via env vars (see .env.example).
+Persistent state в SQLite (/app/data/orders.db):
+  - дедуп callback'ов выживает рестарты воркеров/контейнера в пределах деплоя
+  - история покупателей (email, phone, invite_link, продукт, время)
+  ВАЖНО: TimeWeb Cloud Apps пересоздаёт ФС на каждом git push — БД при деплое сбрасывается.
+  Для долгосрочного бэкапа покупатели дополнительно пишутся в лог как BUYER:... (TimeWeb хранит логи).
 """
 import hashlib
 import json
 import logging
 import os
-import threading
+import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
+from pathlib import Path
 
 import requests
-from flask import Flask, jsonify, redirect, request
+from flask import Flask, abort, jsonify, redirect, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-# ─────────────────────────── config ───────────────────────────
+# ─────────────────────────── general config ───────────────────────────
 
 GPL_API_KEY = os.environ["GPL_API_KEY"]
 GPL_ACCOUNT = os.environ["GPL_ACCOUNT"]
 TG_BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
-TG_CHANNEL_ID = int(os.environ["TG_CHANNEL_ID"])
 UNISENDER_KEY = os.environ["UNISENDER_KEY"]
-UNISENDER_LIST_ID = os.environ["UNISENDER_LIST_ID"]
 UNISENDER_SENDER_NAME = os.environ["UNISENDER_SENDER_NAME"]
 UNISENDER_SENDER_EMAIL = os.environ["UNISENDER_SENDER_EMAIL"]
-SUCCESS_URL = os.environ["SUCCESS_URL"]
-FAIL_URL = os.environ["FAIL_URL"]
 
-PRODUCT_NAME = os.environ.get("PRODUCT_NAME", "Горячий След")
-PRODUCT_PRICE = int(os.environ.get("PRODUCT_PRICE", "3"))  # TEMP: smoke-test price
+SUPPORT_TG = "https://t.me/gumirovyaroslav"
+DB_PATH = Path(os.environ.get("DATA_DIR", "/app/data")) / "orders.db"
+
+# ─────────────────────────── PRODUCTS REGISTRY ───────────────────────────
+# Чтобы добавить продукт: новый ключ в PRODUCTS, обновить кнопку в Tilda на /p/<slug>/create-payment.
+# TG-канал: добавь бота админом, дай ему «Создание пригласительных ссылок».
+# UniSender: создай отдельный список под покупателей продукта.
+
+PRODUCTS = {
+    "hotrack": {
+        "name": os.environ.get("PRODUCT_NAME", "Горячий След"),
+        "price_rub": int(os.environ.get("PRODUCT_PRICE", "3790")),
+        "tg_channel_id": int(os.environ["TG_CHANNEL_ID"]),
+        "unisender_list_id": os.environ["UNISENDER_LIST_ID"],
+        "success_url": os.environ.get("SUCCESS_URL", "https://gumirovbros.ru/spasibohottrail"),
+        "fail_url": os.environ.get("FAIL_URL", "https://gumirovbros.ru/errorhottrail"),
+        "email_subject": "Горячий След — ваш доступ готов",
+        "email_intro": "Спасибо за покупку. Ниже — личная одноразовая ссылка для входа в закрытый Telegram-канал. Внутри ты сразу увидишь закреплённый PDF-протокол.",
+    },
+    # ───── шаблон будущего продукта ─────
+    # "neurobuilder": {
+    #     "name": "NeuroBuilder",
+    #     "price_rub": 9990,
+    #     "tg_channel_id": int(os.environ["NEUROBUILDER_TG_CHANNEL_ID"]),
+    #     "unisender_list_id": os.environ["NEUROBUILDER_UNISENDER_LIST_ID"],
+    #     "success_url": "https://gumirovbros.ru/spasibo-neurobuilder",
+    #     "fail_url":   "https://gumirovbros.ru/error-neurobuilder",
+    #     "email_subject": "NeuroBuilder — ваш доступ готов",
+    #     "email_intro":  "...",
+    # },
+}
+
+DEFAULT_PRODUCT_SLUG = "hotrack"
 
 # ─────────────────────────── app ──────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("hotrack")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("payments")
 
 app = Flask(__name__)
-# Trust X-Forwarded-* headers set by TimeWeb's reverse proxy so request.host_url
-# returns the public https://... URL, not the internal one.
+# TimeWeb's reverse proxy → доверяем X-Forwarded-* (для request.host_url и rate-limit по реальному IP).
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
-_processed_lock = threading.Lock()
-_processed: set[str] = set()
+# Rate-limit по реальному IP. По умолчанию ничего не лимитирует — только эндпоинты с @limiter.limit.
+limiter = Limiter(get_remote_address, app=app, default_limits=[])
+
+# ─────────────────────────── DB ───────────────────────────────
+
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
-# ─────────────────────────── helpers ──────────────────────────
+@contextmanager
+def _db():
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
-# Retry transient network failures (timeout / connection reset) with exponential backoff.
-# We do NOT retry on 4xx/5xx — those mean the remote saw the request, retrying could double-charge / double-send.
+
+def _init_db():
+    with _db() as conn:
+        # orders — старт оформления (запись из /create-payment), дедуп и поиск продукта на колбэке.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                deal_id      TEXT PRIMARY KEY,
+                product_slug TEXT NOT NULL,
+                price_rub    INTEGER NOT NULL,
+                ip           TEXT,
+                user_agent   TEXT,
+                referer      TEXT,
+                created_at   TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # buyers — успешно обработанные платежи (запись после TG+UniSender). Single source of truth по покупателям.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS buyers (
+                deal_id      TEXT PRIMARY KEY,
+                product_slug TEXT NOT NULL,
+                email        TEXT NOT NULL,
+                phone        TEXT,
+                invite_link  TEXT,
+                amount_rub   REAL,
+                completed_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+
+
+_init_db()
+
+# ─────────────────────────── HTTP helpers ───────────────────────────
+
 _TRANSIENT_EXC = (requests.ConnectionError, requests.Timeout)
 
 
 def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
+    """Ретраим только сетевые сбои. На 4xx/5xx не ретраим — удалённый видел запрос, повтор может задвоить."""
     last_exc = None
     for i in range(attempts):
         try:
@@ -73,12 +150,13 @@ def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
     raise last_exc
 
 
-def _gpl_init_payment(server_base_url: str) -> str | None:
-    """Call GetPlatinum init-payment-url. Returns formUrl or None."""
+# ─────────────────────────── domain ops ───────────────────────────
+
+def _gpl_init_payment(server_base_url: str, product_slug: str, product: dict) -> tuple[str | None, str]:
+    """Создаёт платёж в GPL. Возвращает (form_url, deal_id)."""
     deal_id = uuid.uuid4().hex
     client_id = uuid.uuid4().hex
-    # GetPlatinum принимает суммы в копейках.
-    amount_kopecks = PRODUCT_PRICE * 100
+    amount_kopecks = product["price_rub"] * 100  # GPL принимает в копейках
     payload = {
         "dealId": deal_id,
         "currency": "RUB",
@@ -86,7 +164,7 @@ def _gpl_init_payment(server_base_url: str) -> str | None:
         "positions": [
             {
                 "prefix": 12,
-                "name": PRODUCT_NAME,
+                "name": product["name"],
                 "price": amount_kopecks,
                 "quantity": 1,
                 "vat": "none",
@@ -94,39 +172,32 @@ def _gpl_init_payment(server_base_url: str) -> str | None:
         ],
         "clientParams": {"clientId": client_id},
         "notificationUrl": f"{server_base_url.rstrip('/')}/payment-callback",
-        "successUrl": SUCCESS_URL,
-        "failUrl": FAIL_URL,
-        "customParams": {"dealId": deal_id},
+        "successUrl": product["success_url"],
+        "failUrl": product["fail_url"],
+        # product слаг тоже шлём на случай если БД будет пуста (после деплоя) — fallback на колбэке.
+        "customParams": {"dealId": deal_id, "product": product_slug},
     }
     url = f"https://{GPL_ACCOUNT}.getplatinum.ru/api/public/pay/init-payment-url"
-    headers = {
-        "Authorization": f"Bearer {GPL_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": f"Bearer {GPL_API_KEY}", "Content-Type": "application/json"}
     log.info("GPL init-payment-url request: %s", json.dumps(payload, ensure_ascii=False))
     resp = _post_with_retry(url, headers=headers, json=payload, timeout=10)
     log.info("GPL init-payment-url response: %d %s", resp.status_code, resp.text[:1000])
     resp.raise_for_status()
     data = resp.json()
-    # Try several plausible shapes — exact format only confirmed once first call lands.
-    return (
+    form_url = (
         data.get("formUrl")
         or data.get("paymentUrl")
         or data.get("url")
         or (data.get("result") or {}).get("formUrl")
         or (data.get("data") or {}).get("formUrl")
     )
+    return form_url, deal_id
 
 
-def _tg_create_invite(order_id: str) -> str:
-    """Create one-time Telegram invite link. Returns the link string."""
+def _tg_create_invite(channel_id: int, order_id: str) -> str:
+    """Создаёт одноразовую TG-инвайт-ссылку. RU-IP до api.telegram.org нестабилен — ретрай агрессивный."""
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/createChatInviteLink"
-    body = {
-        "chat_id": TG_CHANNEL_ID,
-        "member_limit": 1,
-        "name": f"order-{order_id}"[:32],  # Telegram name limit
-    }
-    # Telegram API нестабилен с RU-IP (RKN-«рябь»). 5 попыток за ~30 секунд.
+    body = {"chat_id": channel_id, "member_limit": 1, "name": f"order-{order_id}"[:32]}
     resp = _post_with_retry(url, json=body, timeout=10, attempts=5, base_delay=1.0)
     log.info("Telegram createChatInviteLink: %d %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
@@ -136,9 +207,8 @@ def _tg_create_invite(order_id: str) -> str:
     return data["result"]["invite_link"]
 
 
-def _us_send_email(to_email: str, invite_link: str) -> None:
-    """Send transactional email via UniSender sendEmail."""
-    html = _email_template(invite_link)
+def _us_send_email(to_email: str, invite_link: str, product: dict) -> None:
+    html = _email_template(invite_link, product)
     resp = _post_with_retry(
         "https://api.unisender.com/ru/api/sendEmail",
         params={"format": "json"},
@@ -147,9 +217,9 @@ def _us_send_email(to_email: str, invite_link: str) -> None:
             "email": to_email,
             "sender_name": UNISENDER_SENDER_NAME,
             "sender_email": UNISENDER_SENDER_EMAIL,
-            "subject": "Горячий След — ваш доступ готов",
+            "subject": product["email_subject"],
             "body": html,
-            "list_id": UNISENDER_LIST_ID,
+            "list_id": product["unisender_list_id"],
         },
         timeout=15,
     )
@@ -160,7 +230,7 @@ def _us_send_email(to_email: str, invite_link: str) -> None:
         raise RuntimeError(f"UniSender error: {data}")
 
 
-def _email_template(invite_link: str) -> str:
+def _email_template(invite_link: str, product: dict) -> str:
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head><meta charset="UTF-8"></head>
@@ -170,10 +240,10 @@ def _email_template(invite_link: str) -> str:
       <table role="presentation" cellpadding="0" cellspacing="0" width="600" style="max-width:600px;background:#FFFDF7;padding:32px;border:2px solid #B91C1C;">
         <tr><td>
           <h1 style="margin:0 0 16px 0;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;font-weight:900;font-size:28px;line-height:1.1;color:#1A1A1A;text-align:center;">
-            Горячий След — доступ готов
+            {product["name"]} — доступ готов
           </h1>
           <p style="margin:0 0 24px 0;font-size:17px;line-height:1.5;color:#1A1A1A;">
-            Спасибо за покупку. Ниже — личная одноразовая ссылка для входа в закрытый Telegram-канал. Внутри ты сразу увидишь закреплённый PDF-протокол.
+            {product["email_intro"]}
           </p>
           <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin:24px 0;">
             <tr><td align="center">
@@ -191,7 +261,7 @@ def _email_template(invite_link: str) -> str:
           </p>
           <hr style="border:none;border-top:1px solid #DDD;margin:32px 0;">
           <p style="margin:0;font-size:12px;color:#999;text-align:center;">
-            Если что-то не сработало — <a href="https://t.me/gumirovyaroslav" style="color:#999;">напиши нам в Telegram</a>.<br>
+            Если что-то не сработало — <a href="{SUPPORT_TG}" style="color:#999;">напиши нам в Telegram</a>.<br>
             — Братья Гумировы
           </p>
         </td></tr>
@@ -202,8 +272,9 @@ def _email_template(invite_link: str) -> str:
 </html>"""
 
 
+# ─────────────────────────── callback parsing ───────────────────────────
+
 def _extract_email(body: dict) -> str | None:
-    """GPL puts email in clientInfo.email. Other keys are belt-and-suspenders for any future change."""
     return (
         (body.get("clientInfo") or {}).get("email")
         or body.get("email")
@@ -216,8 +287,11 @@ def _extract_email(body: dict) -> str | None:
     )
 
 
+def _extract_phone(body: dict) -> str | None:
+    return (body.get("clientInfo") or {}).get("phone") or body.get("phone")
+
+
 def _extract_order_id(body: dict, raw: str) -> str:
-    """GPL primary identifier is dealId. mdOrder is GPL-internal, kept as fallback."""
     return str(
         body.get("dealId")
         or (body.get("paymentData") or {}).get("mdOrder")
@@ -231,7 +305,6 @@ def _extract_order_id(body: dict, raw: str) -> str:
 
 
 def _is_successful(body: dict, raw_haystack: str) -> bool:
-    """GPL signals success via isSuccess: true (boolean). Other shapes are kept as fallbacks."""
     if body.get("isSuccess") is True:
         return True
     if body.get("status") in {"success", "paid", "completed", "paymentStatusSuccess"}:
@@ -241,28 +314,56 @@ def _is_successful(body: dict, raw_haystack: str) -> bool:
     return False
 
 
+def _resolve_product(deal_id: str, body: dict) -> tuple[str, dict] | tuple[None, None]:
+    """Какой продукт принадлежит этому заказу. Сначала смотрим в БД, потом в customParams (на случай если БД сброшена)."""
+    with _db() as conn:
+        row = conn.execute("SELECT product_slug FROM orders WHERE deal_id=?", (deal_id,)).fetchone()
+    if row:
+        slug = row["product_slug"]
+    else:
+        slug = (body.get("customParams") or {}).get("product")
+    if slug and slug in PRODUCTS:
+        return slug, PRODUCTS[slug]
+    return None, None
+
+
 # ─────────────────────────── routes ───────────────────────────
 
-@app.route("/create-payment", methods=["GET"])
-def create_payment():
-    # Лог конклюдентного согласия — IP, UA, время. Сшивается с email из callback по близкому таймстампу.
-    log.info(
-        "CONSENT: ip=%s ua=%s referer=%s",
-        request.headers.get("X-Forwarded-For", request.remote_addr),
-        request.headers.get("User-Agent", ""),
-        request.headers.get("Referer", ""),
-    )
-    # Behind TimeWeb's reverse proxy, request.host_url respects X-Forwarded-* headers
-    # (see ProxyFix above), so this is always the public https://... origin.
+@app.route("/p/<slug>/create-payment", methods=["GET"])
+@limiter.limit("10 per minute")  # анти-троль: один IP не больше 10 заказов в минуту
+def create_payment_for(slug: str):
+    if slug not in PRODUCTS:
+        abort(404)
+    product = PRODUCTS[slug]
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr)
+    ua = request.headers.get("User-Agent", "")
+    referer = request.headers.get("Referer", "")
+    log.info("CONSENT: product=%s ip=%s ua=%s referer=%s", slug, ip, ua, referer)
     try:
-        form_url = _gpl_init_payment(request.host_url)
+        form_url, deal_id = _gpl_init_payment(request.host_url, slug, product)
     except Exception as exc:
-        log.exception("create-payment: GPL init failed: %s", exc)
-        return redirect(FAIL_URL, code=302)
+        log.exception("create-payment(%s): GPL init failed: %s", slug, exc)
+        return redirect(product["fail_url"], code=302)
     if not form_url:
-        log.error("create-payment: no formUrl in GPL response")
-        return redirect(FAIL_URL, code=302)
+        log.error("create-payment(%s): no formUrl in GPL response", slug)
+        return redirect(product["fail_url"], code=302)
+    # Запишем заказ в БД до редиректа — чтобы на колбэке знать, какой это продукт.
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO orders (deal_id, product_slug, price_rub, ip, user_agent, referer) VALUES (?,?,?,?,?,?)",
+                (deal_id, slug, product["price_rub"], ip, ua, referer),
+            )
+    except Exception as exc:
+        log.exception("Failed to record order %s in DB: %s", deal_id, exc)
+        # Не валим оплату из-за БД — fallback по customParams.product сработает.
     return redirect(form_url, code=302)
+
+
+@app.route("/create-payment", methods=["GET"])
+def create_payment_default():
+    """Совместимость со старой кнопкой Tilda. Дефолтный продукт — hotrack."""
+    return create_payment_for(DEFAULT_PRODUCT_SLUG)
 
 
 @app.route("/payment-callback", methods=["POST"])
@@ -272,9 +373,7 @@ def payment_callback():
 
     body = request.get_json(silent=True) or {}
     if not body:
-        # Some payment systems send form-encoded — try that too.
         body = request.form.to_dict() if request.form else {}
-
     log.info("Callback parsed: %s", json.dumps(body, ensure_ascii=False)[:1000])
 
     raw_haystack = (raw + json.dumps(body, ensure_ascii=False)).lower()
@@ -284,42 +383,69 @@ def payment_callback():
 
     order_id = _extract_order_id(body, raw)
 
-    with _processed_lock:
-        if order_id in _processed:
-            log.info("Duplicate callback for order %s — skipping", order_id)
-            return jsonify({"ok": True, "skipped": "duplicate"}), 200
-        _processed.add(order_id)
+    # Дедуп — атомарно через UNIQUE constraint на buyers.deal_id.
+    # Сначала проверим, не обработан ли уже:
+    with _db() as conn:
+        already = conn.execute("SELECT 1 FROM buyers WHERE deal_id=?", (order_id,)).fetchone()
+    if already:
+        log.info("Duplicate callback for order %s — skipping", order_id)
+        return jsonify({"ok": True, "skipped": "duplicate"}), 200
+
+    slug, product = _resolve_product(order_id, body)
+    if not product:
+        log.error("Cannot resolve product for order %s — body=%s", order_id, body)
+        return jsonify({"ok": True, "skipped": "unknown_product"}), 200
 
     email = _extract_email(body)
     if not email:
         log.error("No email in callback for order %s — body=%s", order_id, body)
         return jsonify({"ok": True, "skipped": "no_email"}), 200
 
+    phone = _extract_phone(body)
+    amount_kopecks = (body.get("paymentData") or {}).get("amount")
+    amount_rub = (amount_kopecks / 100) if isinstance(amount_kopecks, (int, float)) else None
+
     try:
-        invite_link = _tg_create_invite(order_id)
+        invite_link = _tg_create_invite(product["tg_channel_id"], order_id)
     except Exception as exc:
         log.exception("Telegram createChatInviteLink failed: %s", exc)
-        # Откатываем дедуп — иначе при ретрае GPL получит skipped:duplicate.
-        with _processed_lock:
-            _processed.discard(order_id)
-        # 503 → GPL сам повторит колбэк через свой backoff.
         return jsonify({"ok": False, "error": "telegram", "retry": True}), 503
 
     try:
-        _us_send_email(email, invite_link)
+        _us_send_email(email, invite_link, product)
     except Exception as exc:
         log.exception("UniSender sendEmail failed: %s", exc)
-        with _processed_lock:
-            _processed.discard(order_id)
         return jsonify({"ok": False, "error": "unisender", "retry": True}), 503
 
-    log.info("OK: order=%s email=%s", order_id, email)
+    # Atomically запись «куплено» — финальное звено защиты от дублей.
+    try:
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO buyers (deal_id, product_slug, email, phone, invite_link, amount_rub) VALUES (?,?,?,?,?,?)",
+                (order_id, slug, email, phone, invite_link, amount_rub),
+            )
+    except sqlite3.IntegrityError:
+        # Кто-то параллельно вставил — значит дубль. Не страшно, инвайт+письмо уже ушли,
+        # GPL не должен слать колбэки одновременно для одного заказа.
+        log.warning("Race: buyer %s already in DB", order_id)
+
+    # Дублируем в логи как backup на случай, если БД будет потеряна при редеплое.
+    log.info(
+        "BUYER: order=%s product=%s email=%s phone=%s amount_rub=%s invite=%s",
+        order_id, slug, email, phone, amount_rub, invite_link,
+    )
     return jsonify({"ok": True}), 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"}), 200
+
+
+@app.errorhandler(429)
+def ratelimit_handler(e):
+    log.warning("Rate limit hit: %s ip=%s", e, request.headers.get("X-Forwarded-For", request.remote_addr))
+    return jsonify({"error": "too_many_requests"}), 429
 
 
 if __name__ == "__main__":
