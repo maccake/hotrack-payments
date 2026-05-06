@@ -30,8 +30,6 @@ UNISENDER_SENDER_NAME = os.environ["UNISENDER_SENDER_NAME"]
 UNISENDER_SENDER_EMAIL = os.environ["UNISENDER_SENDER_EMAIL"]
 SUCCESS_URL = os.environ["SUCCESS_URL"]
 FAIL_URL = os.environ["FAIL_URL"]
-# SERVER_BASE_URL kept for backward compat / local dev; if unset we derive from request.
-SERVER_BASE_URL = os.environ.get("SERVER_BASE_URL", "")
 
 PRODUCT_NAME = os.environ.get("PRODUCT_NAME", "Горячий След")
 PRODUCT_PRICE = int(os.environ.get("PRODUCT_PRICE", "3790"))
@@ -209,11 +207,10 @@ def _extract_order_id(body: dict, raw: str) -> str:
 
 @app.route("/create-payment", methods=["GET"])
 def create_payment():
-    # Prefer explicit env var; otherwise derive from the public URL the user hit.
-    # Behind TimeWeb's reverse proxy, request.host_url respects X-Forwarded-* headers.
-    base = SERVER_BASE_URL or request.host_url
+    # Behind TimeWeb's reverse proxy, request.host_url respects X-Forwarded-* headers
+    # (see ProxyFix above), so this is always the public https://... origin.
     try:
-        form_url = _gpl_init_payment(base)
+        form_url = _gpl_init_payment(request.host_url)
     except Exception as exc:
         log.exception("create-payment: GPL init failed: %s", exc)
         return redirect(FAIL_URL, code=302)
