@@ -16,6 +16,7 @@ import uuid
 
 import requests
 from flask import Flask, jsonify, redirect, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ─────────────────────────── config ───────────────────────────
 
@@ -29,7 +30,8 @@ UNISENDER_SENDER_NAME = os.environ["UNISENDER_SENDER_NAME"]
 UNISENDER_SENDER_EMAIL = os.environ["UNISENDER_SENDER_EMAIL"]
 SUCCESS_URL = os.environ["SUCCESS_URL"]
 FAIL_URL = os.environ["FAIL_URL"]
-SERVER_BASE_URL = os.environ["SERVER_BASE_URL"]
+# SERVER_BASE_URL kept for backward compat / local dev; if unset we derive from request.
+SERVER_BASE_URL = os.environ.get("SERVER_BASE_URL", "")
 
 PRODUCT_NAME = os.environ.get("PRODUCT_NAME", "Горячий След")
 PRODUCT_PRICE = int(os.environ.get("PRODUCT_PRICE", "3790"))
@@ -43,6 +45,9 @@ logging.basicConfig(
 log = logging.getLogger("hotrack")
 
 app = Flask(__name__)
+# Trust X-Forwarded-* headers set by TimeWeb's reverse proxy so request.host_url
+# returns the public https://... URL, not the internal one.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 _processed_lock = threading.Lock()
 _processed: set[str] = set()
@@ -50,7 +55,7 @@ _processed: set[str] = set()
 
 # ─────────────────────────── helpers ──────────────────────────
 
-def _gpl_init_payment() -> str | None:
+def _gpl_init_payment(server_base_url: str) -> str | None:
     """Call GetPlatinum init-payment-url. Returns formUrl or None."""
     deal_id = uuid.uuid4().hex
     client_id = uuid.uuid4().hex
@@ -68,7 +73,7 @@ def _gpl_init_payment() -> str | None:
             }
         ],
         "clientParams": {"clientId": client_id},
-        "notificationUrl": f"{SERVER_BASE_URL.rstrip('/')}/payment-callback",
+        "notificationUrl": f"{server_base_url.rstrip('/')}/payment-callback",
         "successUrl": SUCCESS_URL,
         "failUrl": FAIL_URL,
         "customParams": {"dealId": deal_id},
@@ -204,8 +209,11 @@ def _extract_order_id(body: dict, raw: str) -> str:
 
 @app.route("/create-payment", methods=["GET"])
 def create_payment():
+    # Prefer explicit env var; otherwise derive from the public URL the user hit.
+    # Behind TimeWeb's reverse proxy, request.host_url respects X-Forwarded-* headers.
+    base = SERVER_BASE_URL or request.host_url
     try:
-        form_url = _gpl_init_payment()
+        form_url = _gpl_init_payment(base)
     except Exception as exc:
         log.exception("create-payment: GPL init failed: %s", exc)
         return redirect(FAIL_URL, code=302)
