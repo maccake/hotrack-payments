@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 
 import requests
@@ -32,7 +33,7 @@ SUCCESS_URL = os.environ["SUCCESS_URL"]
 FAIL_URL = os.environ["FAIL_URL"]
 
 PRODUCT_NAME = os.environ.get("PRODUCT_NAME", "Горячий След")
-PRODUCT_PRICE = int(os.environ.get("PRODUCT_PRICE", "3"))  # TEMP: smoke-test price
+PRODUCT_PRICE = int(os.environ.get("PRODUCT_PRICE", "3790"))
 
 # ─────────────────────────── app ──────────────────────────────
 
@@ -52,6 +53,25 @@ _processed: set[str] = set()
 
 
 # ─────────────────────────── helpers ──────────────────────────
+
+# Retry transient network failures (timeout / connection reset) with exponential backoff.
+# We do NOT retry on 4xx/5xx — those mean the remote saw the request, retrying could double-charge / double-send.
+_TRANSIENT_EXC = (requests.ConnectionError, requests.Timeout)
+
+
+def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return requests.post(url, **kwargs)
+        except _TRANSIENT_EXC as exc:
+            last_exc = exc
+            if i < attempts - 1:
+                delay = base_delay * (2 ** i)
+                log.warning("POST %s transient error (%s), retry %d/%d in %.1fs", url, exc, i + 1, attempts - 1, delay)
+                time.sleep(delay)
+    raise last_exc
+
 
 def _gpl_init_payment(server_base_url: str) -> str | None:
     """Call GetPlatinum init-payment-url. Returns formUrl or None."""
@@ -84,7 +104,7 @@ def _gpl_init_payment(server_base_url: str) -> str | None:
         "Content-Type": "application/json",
     }
     log.info("GPL init-payment-url request: %s", json.dumps(payload, ensure_ascii=False))
-    resp = requests.post(url, headers=headers, json=payload, timeout=10)
+    resp = _post_with_retry(url, headers=headers, json=payload, timeout=10)
     log.info("GPL init-payment-url response: %d %s", resp.status_code, resp.text[:1000])
     resp.raise_for_status()
     data = resp.json()
@@ -106,7 +126,7 @@ def _tg_create_invite(order_id: str) -> str:
         "member_limit": 1,
         "name": f"order-{order_id}"[:32],  # Telegram name limit
     }
-    resp = requests.post(url, json=body, timeout=10)
+    resp = _post_with_retry(url, json=body, timeout=10)
     log.info("Telegram createChatInviteLink: %d %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
     data = resp.json()
@@ -118,7 +138,7 @@ def _tg_create_invite(order_id: str) -> str:
 def _us_send_email(to_email: str, invite_link: str) -> None:
     """Send transactional email via UniSender sendEmail."""
     html = _email_template(invite_link)
-    resp = requests.post(
+    resp = _post_with_retry(
         "https://api.unisender.com/ru/api/sendEmail",
         params={"format": "json"},
         data={
