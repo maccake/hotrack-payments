@@ -271,8 +271,27 @@ def _tg_create_invite(channel_id: int, order_id: str, *, attempts: int = 5, time
     """Создаёт одноразовую TG-инвайт-ссылку. RU-IP до api.telegram.org нестабилен — ретрай агрессивный."""
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/createChatInviteLink"
     body = {"chat_id": channel_id, "member_limit": 1, "name": f"order-{order_id}"[:32]}
-    # Если задан TG_PROXY_URL — идём через прокси (обход RU-блокировки).
-    resp = _post_with_retry(url, json=body, timeout=timeout, attempts=attempts, base_delay=1.0, proxies=TG_PROXIES)
+    proxy_exc = None
+    if TG_PROXIES:
+        try:
+            resp = _post_with_retry(url, json=body, timeout=timeout, attempts=attempts, base_delay=1.0, proxies=TG_PROXIES)
+        except _TRANSIENT_EXC as exc:
+            proxy_exc = exc
+            log.warning("Telegram proxy failed, falling back to direct request: %s", _safe_log_text(exc))
+        else:
+            log.info("Telegram createChatInviteLink via proxy: %d %s", resp.status_code, resp.text[:500])
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok"):
+                raise RuntimeError(f"Telegram returned error: {data}")
+            return data["result"]["invite_link"]
+
+    try:
+        resp = _post_with_retry(url, json=body, timeout=timeout, attempts=attempts, base_delay=1.0)
+    except _TRANSIENT_EXC:
+        if proxy_exc:
+            log.warning("Telegram direct request also failed after proxy fallback")
+        raise
     log.info("Telegram createChatInviteLink: %d %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
     data = resp.json()
