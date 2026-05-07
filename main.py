@@ -386,6 +386,7 @@ def _mark_expired_deliveries() -> None:
             "DELIVERY_FAILED: order=%s product=%s email=%s phone=%s amount_rub=%s error=%s",
             row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], row["last_error"] or "retry window expired",
         )
+        _send_manual_access_email_best_effort(dict(row))
 
 
 def _finish_delivery(row: dict, invite_link: str) -> None:
@@ -459,6 +460,7 @@ def _fail_or_retry_delivery(row: dict, exc: Exception) -> None:
             "DELIVERY_FAILED: order=%s product=%s email=%s phone=%s amount_rub=%s attempts=%s error=%s",
             row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], attempts, error,
         )
+        _send_manual_access_email_best_effort(row)
         _tg_notify_admin(
             f"🔴 <b>Доступ не отправлен</b>\n"
             f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
@@ -546,6 +548,40 @@ def _us_send_email(to_email: str, invite_link: str, product: dict) -> None:
         raise RuntimeError(f"UniSender error: {data}")
 
 
+def _us_send_manual_access_email(to_email: str, product: dict) -> None:
+    resp = _post_with_retry(
+        "https://api.unisender.com/ru/api/sendEmail",
+        params={"format": "json"},
+        data={
+            "api_key": UNISENDER_KEY,
+            "email": to_email,
+            "sender_name": UNISENDER_SENDER_NAME,
+            "sender_email": UNISENDER_SENDER_EMAIL,
+            "subject": f"{product['name']} — оплата прошла, выдадим доступ вручную",
+            "body": _manual_access_email_template(product),
+            "list_id": product["unisender_list_id"],
+        },
+        timeout=15,
+    )
+    log.info("UniSender manual access email: %d %s", resp.status_code, resp.text[:500])
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"UniSender manual access error: {data}")
+
+
+def _send_manual_access_email_best_effort(row: dict) -> None:
+    product = PRODUCTS.get(row["product_slug"])
+    if not product:
+        log.error("Manual access email skipped for order %s: unknown product %s", row["deal_id"], row["product_slug"])
+        return
+    try:
+        _us_send_manual_access_email(row["email"], product)
+        log.info("MANUAL_ACCESS_EMAIL_SENT: order=%s email=%s", row["deal_id"], row["email"])
+    except Exception as exc:
+        log.error("MANUAL_ACCESS_EMAIL_FAILED: order=%s email=%s error=%s", row["deal_id"], row["email"], _safe_log_text(exc))
+
+
 def _email_template(invite_link: str, product: dict) -> str:
     return f"""<!DOCTYPE html>
 <html lang="ru">
@@ -578,6 +614,44 @@ def _email_template(invite_link: str, product: dict) -> str:
           <hr style="border:none;border-top:1px solid #DDD;margin:32px 0;">
           <p style="margin:0;font-size:12px;color:#999;text-align:center;">
             Если что-то не сработало — <a href="{SUPPORT_TG}" style="color:#999;">напиши нам в Telegram</a>.<br>
+            — Братья Гумировы
+          </p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+
+def _manual_access_email_template(product: dict) -> str:
+    product_name = html.escape(product["name"])
+    support_url = html.escape(SUPPORT_TG)
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#ece6d8;font-family:'PT Serif',Georgia,serif;">
+  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#ece6d8;padding:24px 12px;">
+    <tr><td align="center">
+      <table role="presentation" cellpadding="0" cellspacing="0" width="600" style="max-width:600px;background:#FFFDF7;padding:32px;border:2px solid #B91C1C;">
+        <tr><td>
+          <h1 style="margin:0 0 16px 0;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;font-weight:900;font-size:28px;line-height:1.1;color:#1A1A1A;text-align:center;">
+            {product_name} — оплата прошла
+          </h1>
+          <p style="margin:0 0 18px 0;font-size:17px;line-height:1.5;color:#1A1A1A;">
+            Спасибо за покупку. Из-за нестабильной работы Telegram сейчас не получилось автоматически выдать вам доступ в закрытый канал.
+          </p>
+          <p style="margin:0 0 24px 0;font-size:17px;line-height:1.5;color:#1A1A1A;">
+            Напишите нам в Telegram — мы выдадим доступ вручную без проблем.
+          </p>
+          <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="margin:24px 0;">
+            <tr><td align="center">
+              <a href="{support_url}" style="display:inline-block;background:#B91C1C;color:#FFFFFF;text-decoration:none;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;font-weight:900;font-size:18px;padding:18px 36px;letter-spacing:0.5px;">
+                НАПИСАТЬ В TELEGRAM
+              </a>
+            </td></tr>
+          </table>
+          <p style="margin:24px 0 0 0;font-size:14px;line-height:1.5;color:#555;text-align:center;">
             — Братья Гумировы
           </p>
         </td></tr>
