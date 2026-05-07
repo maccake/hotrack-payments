@@ -9,6 +9,9 @@ preload_app = True
 
 def post_fork(server, worker):
     # preload_app импортирует main.py в master-процессе; фоновые потоки стартуем только после fork.
-    from main import start_delivery_worker
+    from main import start_delivery_worker, start_report_scheduler
 
     start_delivery_worker()
+    # Только один воркер шлёт отчёты — _report_sent_dates in-memory дедуп предотвращает дубли,
+    # но стартуем во всех на случай если первый упадёт.
+    start_report_scheduler()

@@ -66,6 +66,9 @@ DELIVERY_RETRY_WINDOW_SECONDS = int(os.environ.get("DELIVERY_RETRY_WINDOW_SECOND
 DELIVERY_POLL_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_POLL_INTERVAL_SECONDS", "2"))
 DELIVERY_PROCESSING_STALE_SECONDS = int(os.environ.get("DELIVERY_PROCESSING_STALE_SECONDS", "120"))
 
+IZHEVSK_TZ = timezone(timedelta(hours=5))
+REPORT_HOUR_LOCAL = 22  # 22:00 по Ижевску
+
 # ─────────────────────────── PRODUCTS REGISTRY ───────────────────────────
 # Чтобы добавить продукт: новый ключ в PRODUCTS, обновить кнопку в Tilda на /p/<slug>/create-payment.
 # TG-канал: добавь бота админом, дай ему «Создание пригласительных ссылок».
@@ -247,6 +250,103 @@ def _tg_notify_admin(text: str) -> None:
             log.warning("Admin notify failed: %d %s", resp.status_code, _safe_log_text(resp.text[:500]))
     except Exception as exc:
         log.warning("Admin notify failed (non-critical): %s", _safe_log_text(exc))
+
+
+# ─────────────────────────── daily/weekly/monthly reports ───────────────────────────
+
+def _stats_since(cutoff_utc: str) -> dict:
+    with _db() as conn:
+        clicks = conn.execute("SELECT COUNT(*) FROM orders WHERE created_at >= ?", (cutoff_utc,)).fetchone()[0]
+        payments = conn.execute("SELECT COUNT(*) FROM buyers WHERE completed_at >= ?", (cutoff_utc,)).fetchone()[0]
+        revenue = conn.execute("SELECT COALESCE(SUM(amount_rub), 0) FROM buyers WHERE completed_at >= ?", (cutoff_utc,)).fetchone()[0]
+        failed = conn.execute("SELECT COUNT(*) FROM deliveries WHERE status='failed' AND updated_at >= ?", (cutoff_utc,)).fetchone()[0]
+    return {
+        "clicks": clicks,
+        "payments": payments,
+        "revenue": revenue or 0,
+        "failed": failed,
+        "conversion": round(payments / clicks * 100, 1) if clicks > 0 else 0,
+    }
+
+
+def _izh_day_start_utc(days_ago: int = 0) -> str:
+    now_izh = datetime.now(IZHEVSK_TZ)
+    day = (now_izh - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return day.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _izh_month_start_utc() -> str:
+    now_izh = datetime.now(IZHEVSK_TZ)
+    month_start = now_izh.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return month_start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fmt_money(v: float) -> str:
+    return f"{v:,.0f} ₽".replace(",", " ")
+
+
+def _fmt_stats_line(s: dict) -> str:
+    line = f"Кликов: {s['clicks']} · Оплат: {s['payments']} · Конверсия: {s['conversion']}%"
+    line += f"\nВыручка: {_fmt_money(s['revenue'])}"
+    if s["failed"]:
+        line += f"\n⚠️ Ошибок доставки: {s['failed']}"
+    return line
+
+
+def _build_daily_report() -> str:
+    now_izh = datetime.now(IZHEVSK_TZ)
+    day = _stats_since(_izh_day_start_utc(0))
+    week = _stats_since(_izh_day_start_utc(6))
+    month = _stats_since(_izh_month_start_utc())
+
+    months_ru = {1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
+                 7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"}
+
+    lines = [
+        f"📊 <b>Сводка · {now_izh.strftime('%d.%m.%Y')}</b>",
+        "",
+        f"<b>▸ Сегодня</b>",
+        _fmt_stats_line(day),
+        "",
+        f"<b>▸ 7 дней</b>",
+        _fmt_stats_line(week),
+        "",
+        f"<b>▸ {months_ru.get(now_izh.month, str(now_izh.month))}</b>",
+        _fmt_stats_line(month),
+    ]
+    return "\n".join(lines)
+
+
+_report_sent_dates: dict[str, str] = {}
+_report_scheduler_started = False
+_report_scheduler_lock = threading.Lock()
+
+
+def _report_scheduler_loop() -> None:
+    log.info("Report scheduler started pid=%s (daily at %d:00 Izhevsk / %d:00 UTC)", os.getpid(), REPORT_HOUR_LOCAL, (REPORT_HOUR_LOCAL - 5) % 24)
+    while True:
+        try:
+            now_izh = datetime.now(IZHEVSK_TZ)
+            date_key = now_izh.strftime("%Y-%m-%d")
+            if now_izh.hour == REPORT_HOUR_LOCAL and _report_sent_dates.get("daily") != date_key:
+                report = _build_daily_report()
+                _tg_notify_admin(report)
+                _report_sent_dates["daily"] = date_key
+                log.info("Daily report sent for %s", date_key)
+        except Exception as exc:
+            log.error("Report scheduler error: %s", _safe_log_text(exc))
+        time.sleep(30)
+
+
+def start_report_scheduler() -> None:
+    global _report_scheduler_started
+    with _report_scheduler_lock:
+        if _report_scheduler_started:
+            return
+        thread = threading.Thread(target=_report_scheduler_loop, name="report-scheduler", daemon=True)
+        thread.start()
+        _report_scheduler_started = True
+        log.info("Report scheduler started pid=%s", os.getpid())
 
 
 # ─────────────────────────── domain ops ───────────────────────────
@@ -766,15 +866,16 @@ def create_payment_for(slug: str):
         form_url, deal_id = _gpl_init_payment(request.host_url, slug, product)
     except Exception as exc:
         log.exception("create-payment(%s): GPL init failed: %s", slug, exc)
+        _tg_notify_admin(f"🔴 <b>GPL init failed</b>\n{html.escape(product['name'])}\n{html.escape(_safe_log_text(exc)[:200])}")
         return redirect(product["fail_url"], code=302)
     if not form_url:
         log.error("create-payment(%s): no formUrl in GPL response", slug)
+        _tg_notify_admin(f"🔴 <b>GPL не вернул formUrl</b>\n{html.escape(product['name'])}")
         return redirect(product["fail_url"], code=302)
-    # Защита от open-redirect: form_url ДОЛЖЕН быть https://*.getplatinum.ru.
-    # Если GPL когда-то взломан и вернёт чужой URL — мы его не проксируем.
     parsed = urlparse(form_url)
     if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".getplatinum.ru"):
         log.error("create-payment(%s): suspicious formUrl %s — refusing redirect", slug, form_url)
+        _tg_notify_admin(f"🔴 <b>Подозрительный formUrl от GPL</b>\n{html.escape(form_url[:200])}")
         return redirect(product["fail_url"], code=302)
     log.info("CONSENT_ORDER: %s", json.dumps({
         "order": deal_id,
@@ -838,11 +939,13 @@ def payment_callback():
     slug, product = _resolve_product(order_id, body)
     if not product:
         log.error("Cannot resolve product for order %s — body=%s", order_id, body)
+        _tg_notify_admin(f"🔴 <b>Неизвестный продукт в callback</b>\nЗаказ: <code>{html.escape(order_id)}</code>")
         return jsonify({"ok": True, "skipped": "unknown_product"}), 200
 
     email = _extract_email(body)
     if not email:
         log.error("No email in callback for order %s — body=%s", order_id, body)
+        _tg_notify_admin(f"🔴 <b>Нет email в callback</b>\nЗаказ: <code>{html.escape(order_id)}</code>\nПродукт: {html.escape(slug)}")
         return jsonify({"ok": True, "skipped": "no_email"}), 200
 
     phone = _extract_phone(body)
@@ -872,4 +975,5 @@ def ratelimit_handler(e):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     start_delivery_worker()
+    start_report_scheduler()
     app.run(host="0.0.0.0", port=port, debug=False)
