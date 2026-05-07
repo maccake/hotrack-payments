@@ -51,7 +51,8 @@ CONSENT_TEXT = os.environ.get(
 )
 
 # Опциональные — для админ-нотификаций и /stats. Если не заданы — функционал просто выключен.
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # numeric id приватного канала/группы куда слать сводку
+ADMIN_BOT_TOKEN = os.environ.get("ADMIN_BOT_TOKEN")
+ADMIN_CHAT_ID_RAW = os.environ.get("ADMIN_CHAT_ID")  # numeric id приватного канала/группы куда слать сводку
 STATS_TOKEN = os.environ.get("STATS_TOKEN")      # секрет в URL для просмотра статистики
 
 # Telegram API по умолчанию вызываем напрямую. Прокси включается только явным TG_PROXY_ENABLED=1,
@@ -181,9 +182,25 @@ _init_db()
 _TRANSIENT_EXC = (requests.ConnectionError, requests.Timeout)
 
 
+def _normalize_admin_chat_id(value: str | None) -> str | None:
+    if not value:
+        return None
+    chat_id = value.strip()
+    if not chat_id:
+        return None
+    if chat_id.startswith("-") or chat_id.startswith("@"):
+        return chat_id
+    if chat_id.isdigit() and len(chat_id) >= 10:
+        return f"-100{chat_id}"
+    return chat_id
+
+
+ADMIN_CHAT_ID = _normalize_admin_chat_id(ADMIN_CHAT_ID_RAW)
+
+
 def _safe_log_text(value) -> str:
     text = str(value)
-    replacements = [TG_BOT_TOKEN, TG_PROXY_URL]
+    replacements = [TG_BOT_TOKEN, ADMIN_BOT_TOKEN, TG_PROXY_URL]
     for secret in replacements:
         if secret:
             text = text.replace(secret, "***")
@@ -216,16 +233,18 @@ def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
 
 def _tg_notify_admin(text: str) -> None:
     """Отправить сообщение в админ-канал. НИКОГДА не должна валить основной флоу."""
-    if not ADMIN_CHAT_ID:
+    if not ADMIN_BOT_TOKEN or not ADMIN_CHAT_ID:
         return
     try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        requests.post(
+        url = f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/sendMessage"
+        resp = requests.post(
             url,
             json={"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=5,
             proxies=TG_PROXIES,
         )
+        if resp.status_code >= 400:
+            log.warning("Admin notify failed: %d %s", resp.status_code, _safe_log_text(resp.text[:500]))
     except Exception as exc:
         log.warning("Admin notify failed (non-critical): %s", _safe_log_text(exc))
 
