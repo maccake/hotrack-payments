@@ -174,6 +174,15 @@ _init_db()
 _TRANSIENT_EXC = (requests.ConnectionError, requests.Timeout)
 
 
+def _safe_log_text(value) -> str:
+    text = str(value)
+    replacements = [TG_BOT_TOKEN, TG_PROXY_URL]
+    for secret in replacements:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
 def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
     """Ретраим только сетевые сбои. На 4xx/5xx не ретраим — удалённый видел запрос, повтор может задвоить."""
     last_exc = None
@@ -184,7 +193,14 @@ def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
             last_exc = exc
             if i < attempts - 1:
                 delay = base_delay * (2 ** i)
-                log.warning("POST %s transient error (%s), retry %d/%d in %.1fs", url, exc, i + 1, attempts - 1, delay)
+                log.warning(
+                    "POST %s transient error (%s), retry %d/%d in %.1fs",
+                    _safe_log_text(url),
+                    _safe_log_text(exc),
+                    i + 1,
+                    attempts - 1,
+                    delay,
+                )
                 time.sleep(delay)
     raise last_exc
 
@@ -203,8 +219,8 @@ def _tg_notify_admin(text: str) -> None:
             timeout=5,
             proxies=TG_PROXIES,
         )
-    except Exception:
-        log.exception("Admin notify failed (non-critical)")
+    except Exception as exc:
+        log.warning("Admin notify failed (non-critical): %s", _safe_log_text(exc))
 
 
 # ─────────────────────────── domain ops ───────────────────────────
@@ -406,7 +422,7 @@ def _finish_delivery(row: dict, invite_link: str) -> None:
 
 
 def _fail_or_retry_delivery(row: dict, exc: Exception) -> None:
-    error = str(exc)[:1000]
+    error = _safe_log_text(exc)[:1000]
     attempts = int(row["attempts"])
     created_at = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
     elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
@@ -493,10 +509,10 @@ def _delivery_worker_loop() -> None:
             try:
                 _process_delivery(row)
             except Exception as exc:
-                log.exception("Delivery attempt failed for order %s: %s", row["deal_id"], exc)
+                log.error("Delivery attempt failed for order %s: %s", row["deal_id"], _safe_log_text(exc))
                 _fail_or_retry_delivery(row, exc)
         except Exception as exc:
-            log.exception("Delivery worker loop error: %s", exc)
+            log.error("Delivery worker loop error: %s", _safe_log_text(exc))
             time.sleep(DELIVERY_POLL_INTERVAL_SECONDS)
 
 
