@@ -46,6 +46,11 @@ DB_PATH = Path(os.environ.get("DATA_DIR", "/app/data")) / "orders.db"
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # numeric id приватного канала/группы куда слать сводку
 STATS_TOKEN = os.environ.get("STATS_TOKEN")      # секрет в URL для просмотра статистики
 
+# Опциональный прокси для запросов к api.telegram.org (для обхода RU-блокировки).
+# Формат: socks5://user:pass@host:port или http://user:pass@host:port. Если не задан — прямые запросы как раньше.
+TG_PROXY_URL = os.environ.get("TG_PROXY_URL")
+TG_PROXIES = {"https": TG_PROXY_URL, "http": TG_PROXY_URL} if TG_PROXY_URL else None
+
 # ─────────────────────────── PRODUCTS REGISTRY ───────────────────────────
 # Чтобы добавить продукт: новый ключ в PRODUCTS, обновить кнопку в Tilda на /p/<slug>/create-payment.
 # TG-канал: добавь бота админом, дай ему «Создание пригласительных ссылок».
@@ -168,6 +173,7 @@ def _tg_notify_admin(text: str) -> None:
             url,
             json={"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=5,
+            proxies=TG_PROXIES,
         )
     except Exception:
         log.exception("Admin notify failed (non-critical)")
@@ -221,7 +227,8 @@ def _tg_create_invite(channel_id: int, order_id: str) -> str:
     """Создаёт одноразовую TG-инвайт-ссылку. RU-IP до api.telegram.org нестабилен — ретрай агрессивный."""
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/createChatInviteLink"
     body = {"chat_id": channel_id, "member_limit": 1, "name": f"order-{order_id}"[:32]}
-    resp = _post_with_retry(url, json=body, timeout=10, attempts=5, base_delay=1.0)
+    # Если задан TG_PROXY_URL — идём через прокси (обход RU-блокировки).
+    resp = _post_with_retry(url, json=body, timeout=10, attempts=5, base_delay=1.0, proxies=TG_PROXIES)
     log.info("Telegram createChatInviteLink: %d %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
     data = resp.json()
