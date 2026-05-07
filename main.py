@@ -176,6 +176,12 @@ def _init_db():
             CREATE INDEX IF NOT EXISTS idx_deliveries_ready
             ON deliveries (status, next_attempt_at, created_at)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS report_log (
+                report_key TEXT PRIMARY KEY,
+                sent_at    TEXT DEFAULT (datetime('now'))
+            )
+        """)
 
 
 _init_db()
@@ -317,9 +323,23 @@ def _build_daily_report() -> str:
     return "\n".join(lines)
 
 
-_report_sent_dates: dict[str, str] = {}
 _report_scheduler_started = False
 _report_scheduler_lock = threading.Lock()
+
+
+def _report_already_sent(key: str) -> bool:
+    with _db() as conn:
+        return conn.execute("SELECT 1 FROM report_log WHERE report_key=?", (key,)).fetchone() is not None
+
+
+def _mark_report_sent(key: str) -> bool:
+    """Атомарно помечает отчёт отправленным. Возвращает True если удалось (первый воркер), False если дубль."""
+    try:
+        with _db() as conn:
+            conn.execute("INSERT INTO report_log (report_key) VALUES (?)", (key,))
+        return True
+    except sqlite3.IntegrityError:
+        return False
 
 
 def _report_scheduler_loop() -> None:
@@ -328,11 +348,12 @@ def _report_scheduler_loop() -> None:
         try:
             now_izh = datetime.now(IZHEVSK_TZ)
             date_key = now_izh.strftime("%Y-%m-%d")
-            if now_izh.hour == REPORT_HOUR_LOCAL and _report_sent_dates.get("daily") != date_key:
-                report = _build_daily_report()
-                _tg_notify_admin(report)
-                _report_sent_dates["daily"] = date_key
-                log.info("Daily report sent for %s", date_key)
+            report_key = f"daily:{date_key}"
+            if now_izh.hour == REPORT_HOUR_LOCAL and not _report_already_sent(report_key):
+                if _mark_report_sent(report_key):
+                    report = _build_daily_report()
+                    _tg_notify_admin(report)
+                    log.info("Daily report sent for %s", date_key)
         except Exception as exc:
             log.error("Report scheduler error: %s", _safe_log_text(exc))
         time.sleep(30)
@@ -954,9 +975,9 @@ def payment_callback():
 
     delivery_status = _enqueue_delivery(order_id, slug, email, phone, amount_rub)
     _tg_notify_admin(
-        f"✅ <b>Оплата «{html.escape(product['name'])}»</b>\n"
+        f"💰 <b>Получена оплата «{html.escape(product['name'])}»</b>\n"
         f"Заказ: <code>{html.escape(order_id)}</code>\n"
-        f"Статус доставки: <code>{html.escape(delivery_status)}</code>"
+        f"Выдаю доступ…"
     )
     return jsonify({"ok": True, "delivery": delivery_status}), 200
 
