@@ -48,10 +48,14 @@ DB_PATH = Path(os.environ.get("DATA_DIR", "/app/data")) / "orders.db"
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # numeric id приватного канала/группы куда слать сводку
 STATS_TOKEN = os.environ.get("STATS_TOKEN")      # секрет в URL для просмотра статистики
 
-# Telegram API вызываем напрямую. Прокси proxys.io с TimeWeb-IP стабильно таймаутит и только задерживает delivery.
+# Telegram API по умолчанию вызываем напрямую. Прокси включается только явным TG_PROXY_ENABLED=1,
+# чтобы старый нерабочий TG_PROXY_URL в TimeWeb не задерживал delivery.
+TG_PROXY_URL = os.environ.get("TG_PROXY_URL")
+TG_PROXY_ENABLED = os.environ.get("TG_PROXY_ENABLED") == "1"
+TG_PROXIES = {"https": TG_PROXY_URL, "http": TG_PROXY_URL} if (TG_PROXY_ENABLED and TG_PROXY_URL) else None
 
 # Delivery queue: callback должен отвечать платёжке быстро, а TG/UniSender работают в фоне.
-DELIVERY_RETRY_WINDOW_SECONDS = int(os.environ.get("DELIVERY_RETRY_WINDOW_SECONDS", "600"))
+DELIVERY_RETRY_WINDOW_SECONDS = int(os.environ.get("DELIVERY_RETRY_WINDOW_SECONDS", "360"))
 DELIVERY_POLL_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_POLL_INTERVAL_SECONDS", "2"))
 DELIVERY_PROCESSING_STALE_SECONDS = int(os.environ.get("DELIVERY_PROCESSING_STALE_SECONDS", "120"))
 
@@ -173,7 +177,7 @@ _TRANSIENT_EXC = (requests.ConnectionError, requests.Timeout)
 
 def _safe_log_text(value) -> str:
     text = str(value)
-    replacements = [TG_BOT_TOKEN]
+    replacements = [TG_BOT_TOKEN, TG_PROXY_URL]
     for secret in replacements:
         if secret:
             text = text.replace(secret, "***")
@@ -214,6 +218,7 @@ def _tg_notify_admin(text: str) -> None:
             url,
             json={"chat_id": ADMIN_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=5,
+            proxies=TG_PROXIES,
         )
     except Exception as exc:
         log.warning("Admin notify failed (non-critical): %s", _safe_log_text(exc))
@@ -267,8 +272,9 @@ def _tg_create_invite(channel_id: int, order_id: str, *, attempts: int = 5, time
     """Создаёт одноразовую TG-инвайт-ссылку. RU-IP до api.telegram.org нестабилен — ретрай агрессивный."""
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/createChatInviteLink"
     body = {"chat_id": channel_id, "member_limit": 1, "name": f"order-{order_id}"[:32]}
-    resp = _post_with_retry(url, json=body, timeout=timeout, attempts=attempts, base_delay=1.0)
-    log.info("Telegram createChatInviteLink: %d %s", resp.status_code, resp.text[:500])
+    resp = _post_with_retry(url, json=body, timeout=timeout, attempts=attempts, base_delay=1.0, proxies=TG_PROXIES)
+    route = "proxy" if TG_PROXIES else "direct"
+    log.info("Telegram createChatInviteLink via %s: %d %s", route, resp.status_code, resp.text[:500])
     resp.raise_for_status()
     data = resp.json()
     if not data.get("ok"):
