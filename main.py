@@ -43,6 +43,12 @@ UNISENDER_SENDER_EMAIL = os.environ["UNISENDER_SENDER_EMAIL"]
 
 SUPPORT_TG = "https://t.me/gumirovyaroslav"
 DB_PATH = Path(os.environ.get("DATA_DIR", "/app/data")) / "orders.db"
+CONSENT_TEXT_VERSION = os.environ.get("CONSENT_TEXT_VERSION", "tilda-buy-button-2026-05-07")
+CONSENT_TEXT = os.environ.get(
+    "CONSENT_TEXT",
+    "Нажимая «Забрать», я принимаю оферту, политику обработки персональных данных "
+    "и даю согласие на получение рекламно-информационных рассылок.",
+)
 
 # Опциональные — для админ-нотификаций и /stats. Если не заданы — функционал просто выключен.
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")  # numeric id приватного канала/группы куда слать сводку
@@ -751,6 +757,16 @@ def create_payment_for(slug: str):
     if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".getplatinum.ru"):
         log.error("create-payment(%s): suspicious formUrl %s — refusing redirect", slug, form_url)
         return redirect(product["fail_url"], code=302)
+    log.info("CONSENT_ORDER: %s", json.dumps({
+        "order": deal_id,
+        "product": slug,
+        "price_rub": product["price_rub"],
+        "ip": ip,
+        "ua": ua,
+        "referer": referer,
+        "consent_version": CONSENT_TEXT_VERSION,
+        "consent_text": CONSENT_TEXT,
+    }, ensure_ascii=False, sort_keys=True))
     # Запишем заказ в БД до редиректа — чтобы на колбэке знать, какой это продукт.
     try:
         with _db() as conn:
