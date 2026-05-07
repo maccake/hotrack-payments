@@ -327,19 +327,23 @@ _report_scheduler_started = False
 _report_scheduler_lock = threading.Lock()
 
 
-def _report_already_sent(key: str) -> bool:
-    with _db() as conn:
-        return conn.execute("SELECT 1 FROM report_log WHERE report_key=?", (key,)).fetchone() is not None
-
-
-def _mark_report_sent(key: str) -> bool:
-    """Атомарно помечает отчёт отправленным. Возвращает True если удалось (первый воркер), False если дубль."""
+def _try_claim_report(key: str) -> bool:
+    """Атомарно проверяет и помечает отчёт. BEGIN IMMEDIATE блокирует запись — второй воркер ждёт."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=10, isolation_level=None)
     try:
-        with _db() as conn:
-            conn.execute("INSERT INTO report_log (report_key) VALUES (?)", (key,))
+        conn.execute("BEGIN IMMEDIATE")
+        exists = conn.execute("SELECT 1 FROM report_log WHERE report_key=?", (key,)).fetchone()
+        if exists:
+            conn.rollback()
+            return False
+        conn.execute("INSERT INTO report_log (report_key) VALUES (?)", (key,))
+        conn.commit()
         return True
-    except sqlite3.IntegrityError:
+    except Exception:
+        conn.rollback()
         return False
+    finally:
+        conn.close()
 
 
 def _report_scheduler_loop() -> None:
@@ -349,11 +353,10 @@ def _report_scheduler_loop() -> None:
             now_izh = datetime.now(IZHEVSK_TZ)
             date_key = now_izh.strftime("%Y-%m-%d")
             report_key = f"daily:{date_key}"
-            if now_izh.hour == REPORT_HOUR_LOCAL and not _report_already_sent(report_key):
-                if _mark_report_sent(report_key):
-                    report = _build_daily_report()
-                    _tg_notify_admin(report)
-                    log.info("Daily report sent for %s", date_key)
+            if now_izh.hour == REPORT_HOUR_LOCAL and _try_claim_report(report_key):
+                report = _build_daily_report()
+                _tg_notify_admin(report)
+                log.info("Daily report sent for %s", date_key)
         except Exception as exc:
             log.error("Report scheduler error: %s", _safe_log_text(exc))
         time.sleep(30)
