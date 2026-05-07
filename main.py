@@ -18,9 +18,11 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -50,6 +52,11 @@ STATS_TOKEN = os.environ.get("STATS_TOKEN")      # секрет в URL для п
 # Формат: socks5://user:pass@host:port или http://user:pass@host:port. Если не задан — прямые запросы как раньше.
 TG_PROXY_URL = os.environ.get("TG_PROXY_URL")
 TG_PROXIES = {"https": TG_PROXY_URL, "http": TG_PROXY_URL} if TG_PROXY_URL else None
+
+# Delivery queue: callback должен отвечать платёжке быстро, а TG/UniSender работают в фоне.
+DELIVERY_RETRY_WINDOW_SECONDS = int(os.environ.get("DELIVERY_RETRY_WINDOW_SECONDS", "600"))
+DELIVERY_POLL_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_POLL_INTERVAL_SECONDS", "2"))
+DELIVERY_PROCESSING_STALE_SECONDS = int(os.environ.get("DELIVERY_PROCESSING_STALE_SECONDS", "120"))
 
 # ─────────────────────────── PRODUCTS REGISTRY ───────────────────────────
 # Чтобы добавить продукт: новый ключ в PRODUCTS, обновить кнопку в Tilda на /p/<slug>/create-payment.
@@ -137,6 +144,27 @@ def _init_db():
                 completed_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        # deliveries — очередь выдачи доступа. Позволяет быстро ответить GPL 200, даже если TG лежит.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS deliveries (
+                deal_id         TEXT PRIMARY KEY,
+                product_slug    TEXT NOT NULL,
+                email           TEXT NOT NULL,
+                phone           TEXT,
+                amount_rub      REAL,
+                status          TEXT NOT NULL DEFAULT 'pending',
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_error      TEXT,
+                invite_link     TEXT,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_deliveries_ready
+            ON deliveries (status, next_attempt_at, created_at)
+        """)
 
 
 _init_db()
@@ -223,18 +251,265 @@ def _gpl_init_payment(server_base_url: str, product_slug: str, product: dict) ->
     return form_url, deal_id
 
 
-def _tg_create_invite(channel_id: int, order_id: str) -> str:
+def _tg_create_invite(channel_id: int, order_id: str, *, attempts: int = 5, timeout: int = 10) -> str:
     """Создаёт одноразовую TG-инвайт-ссылку. RU-IP до api.telegram.org нестабилен — ретрай агрессивный."""
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/createChatInviteLink"
     body = {"chat_id": channel_id, "member_limit": 1, "name": f"order-{order_id}"[:32]}
     # Если задан TG_PROXY_URL — идём через прокси (обход RU-блокировки).
-    resp = _post_with_retry(url, json=body, timeout=10, attempts=5, base_delay=1.0, proxies=TG_PROXIES)
+    resp = _post_with_retry(url, json=body, timeout=timeout, attempts=attempts, base_delay=1.0, proxies=TG_PROXIES)
     log.info("Telegram createChatInviteLink: %d %s", resp.status_code, resp.text[:500])
     resp.raise_for_status()
     data = resp.json()
     if not data.get("ok"):
         raise RuntimeError(f"Telegram returned error: {data}")
     return data["result"]["invite_link"]
+
+
+# ─────────────────────────── delivery queue ───────────────────────────
+
+def _enqueue_delivery(order_id: str, slug: str, email: str, phone: str | None, amount_rub: float | None) -> str:
+    """Поставить выдачу доступа в очередь. Возвращает текущий статус delivery."""
+    with _db() as conn:
+        buyer = conn.execute("SELECT 1 FROM buyers WHERE deal_id=?", (order_id,)).fetchone()
+        if buyer:
+            return "sent"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO deliveries
+                (deal_id, product_slug, email, phone, amount_rub, status)
+            VALUES (?, ?, ?, ?, ?, 'pending')
+            """,
+            (order_id, slug, email, phone, amount_rub),
+        )
+        row = conn.execute("SELECT status FROM deliveries WHERE deal_id=?", (order_id,)).fetchone()
+    status = row["status"] if row else "unknown"
+    log.info("DELIVERY_QUEUED: order=%s product=%s email=%s phone=%s amount_rub=%s status=%s", order_id, slug, email, phone, amount_rub, status)
+    return status
+
+
+def _requeue_stale_deliveries() -> None:
+    with _db() as conn:
+        conn.execute(
+            """
+            UPDATE deliveries
+            SET status='retrying',
+                next_attempt_at=datetime('now'),
+                last_error=COALESCE(last_error, 'processing stale after worker restart'),
+                updated_at=datetime('now')
+            WHERE status='processing'
+              AND updated_at <= datetime('now', '-' || ? || ' seconds')
+            """,
+            (DELIVERY_PROCESSING_STALE_SECONDS,),
+        )
+
+
+def _claim_next_delivery() -> dict | None:
+    """Атомарно забрать одну готовую delivery-задачу. BEGIN IMMEDIATE сериализует claim между воркерами."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=10, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT *
+            FROM deliveries
+            WHERE status IN ('pending', 'retrying')
+              AND next_attempt_at <= datetime('now')
+              AND created_at > datetime('now', '-' || ? || ' seconds')
+            ORDER BY created_at
+            LIMIT 1
+            """,
+            (DELIVERY_RETRY_WINDOW_SECONDS,),
+        ).fetchone()
+        if not row:
+            conn.commit()
+            return None
+        attempts = int(row["attempts"]) + 1
+        conn.execute(
+            """
+            UPDATE deliveries
+            SET status='processing',
+                attempts=?,
+                last_error=NULL,
+                updated_at=datetime('now')
+            WHERE deal_id=?
+            """,
+            (attempts, row["deal_id"]),
+        )
+        conn.commit()
+        claimed = dict(row)
+        claimed["attempts"] = attempts
+        return claimed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _mark_expired_deliveries() -> None:
+    with _db() as conn:
+        rows = conn.execute(
+            """
+            SELECT deal_id, product_slug, email, phone, amount_rub, last_error
+            FROM deliveries
+            WHERE status IN ('pending', 'retrying')
+              AND created_at <= datetime('now', '-' || ? || ' seconds')
+            """,
+            (DELIVERY_RETRY_WINDOW_SECONDS,),
+        ).fetchall()
+        conn.execute(
+            """
+            UPDATE deliveries
+            SET status='failed',
+                last_error=COALESCE(last_error, 'retry window expired'),
+                updated_at=datetime('now')
+            WHERE status IN ('pending', 'retrying')
+              AND created_at <= datetime('now', '-' || ? || ' seconds')
+            """,
+            (DELIVERY_RETRY_WINDOW_SECONDS,),
+        )
+    for row in rows:
+        log.error(
+            "DELIVERY_FAILED: order=%s product=%s email=%s phone=%s amount_rub=%s error=%s",
+            row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], row["last_error"] or "retry window expired",
+        )
+
+
+def _finish_delivery(row: dict, invite_link: str) -> None:
+    with _db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO buyers (deal_id, product_slug, email, phone, invite_link, amount_rub) VALUES (?,?,?,?,?,?)",
+            (row["deal_id"], row["product_slug"], row["email"], row["phone"], invite_link, row["amount_rub"]),
+        )
+        conn.execute(
+            """
+            UPDATE deliveries
+            SET status='sent',
+                invite_link=?,
+                last_error=NULL,
+                updated_at=datetime('now')
+            WHERE deal_id=?
+            """,
+            (invite_link, row["deal_id"]),
+        )
+    log.info(
+        "BUYER: order=%s product=%s email=%s phone=%s amount_rub=%s invite=%s",
+        row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], invite_link,
+    )
+    _tg_notify_admin(
+        f"✅ <b>Оплата «{html.escape(PRODUCTS[row['product_slug']]['name'])}»</b>\n"
+        f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
+        f"Доступ отправлен"
+    )
+
+
+def _fail_or_retry_delivery(row: dict, exc: Exception) -> None:
+    error = str(exc)[:1000]
+    attempts = int(row["attempts"])
+    created_at = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    elapsed = (datetime.now(timezone.utc) - created_at).total_seconds()
+    if elapsed >= DELIVERY_RETRY_WINDOW_SECONDS:
+        status = "failed"
+        next_attempt_at = None
+    else:
+        status = "retrying"
+        delay = min(60, 2 ** min(attempts - 1, 6))
+        next_attempt_at = (datetime.now(timezone.utc) + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+
+    with _db() as conn:
+        if next_attempt_at:
+            conn.execute(
+                """
+                UPDATE deliveries
+                SET status=?,
+                    next_attempt_at=?,
+                    last_error=?,
+                    updated_at=datetime('now')
+                WHERE deal_id=?
+                """,
+                (status, next_attempt_at, error, row["deal_id"]),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE deliveries
+                SET status=?,
+                    last_error=?,
+                    updated_at=datetime('now')
+                WHERE deal_id=?
+                """,
+                (status, error, row["deal_id"]),
+            )
+
+    if status == "failed":
+        log.error(
+            "DELIVERY_FAILED: order=%s product=%s email=%s phone=%s amount_rub=%s attempts=%s error=%s",
+            row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], attempts, error,
+        )
+        _tg_notify_admin(
+            f"🔴 <b>Доступ не отправлен</b>\n"
+            f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
+            f"Проверь логи DELIVERY_FAILED"
+        )
+    else:
+        log.warning("DELIVERY_RETRY: order=%s attempts=%s error=%s", row["deal_id"], attempts, error)
+
+
+def _process_delivery(row: dict) -> None:
+    product = PRODUCTS.get(row["product_slug"])
+    if not product:
+        raise RuntimeError(f"Unknown product {row['product_slug']}")
+
+    invite_link = row["invite_link"]
+    if not invite_link:
+        invite_link = _tg_create_invite(product["tg_channel_id"], row["deal_id"], attempts=1, timeout=10)
+        with _db() as conn:
+            conn.execute(
+                "UPDATE deliveries SET invite_link=?, updated_at=datetime('now') WHERE deal_id=?",
+                (invite_link, row["deal_id"]),
+            )
+
+    _us_send_email(row["email"], invite_link, product)
+    _finish_delivery(row, invite_link)
+
+
+_delivery_worker_started = False
+_delivery_worker_lock = threading.Lock()
+
+
+def _delivery_worker_loop() -> None:
+    log.info("Delivery worker loop started pid=%s", os.getpid())
+    while True:
+        try:
+            _requeue_stale_deliveries()
+            _mark_expired_deliveries()
+            row = _claim_next_delivery()
+            if not row:
+                time.sleep(DELIVERY_POLL_INTERVAL_SECONDS)
+                continue
+            log.info("DELIVERY_ATTEMPT: order=%s attempt=%s", row["deal_id"], row["attempts"])
+            try:
+                _process_delivery(row)
+            except Exception as exc:
+                log.exception("Delivery attempt failed for order %s: %s", row["deal_id"], exc)
+                _fail_or_retry_delivery(row, exc)
+        except Exception as exc:
+            log.exception("Delivery worker loop error: %s", exc)
+            time.sleep(DELIVERY_POLL_INTERVAL_SECONDS)
+
+
+def start_delivery_worker() -> None:
+    """Стартует один фоновой delivery-thread внутри текущего gunicorn worker-процесса."""
+    global _delivery_worker_started
+    with _delivery_worker_lock:
+        if _delivery_worker_started:
+            return
+        thread = threading.Thread(target=_delivery_worker_loop, name="delivery-worker", daemon=True)
+        thread.start()
+        _delivery_worker_started = True
+        log.info("Delivery worker started pid=%s", os.getpid())
 
 
 def _us_send_email(to_email: str, invite_link: str, product: dict) -> None:
@@ -397,9 +672,7 @@ def create_payment_for(slug: str):
         # Не валим оплату из-за БД — fallback по customParams.product сработает.
     _tg_notify_admin(
         f"🟡 <b>Клик «{html.escape(product['name'])}»</b>\n"
-        f"IP: <code>{html.escape(ip or '-')}</code>\n"
-        f"Сумма: {product['price_rub']} ₽\n"
-        f"Источник: {html.escape(referer or '-')}"
+        f"Сумма: {product['price_rub']} ₽"
     )
     return redirect(form_url, code=302)
 
@@ -450,41 +723,13 @@ def payment_callback():
     amount_kopecks = (body.get("paymentData") or {}).get("amount")
     amount_rub = (amount_kopecks / 100) if isinstance(amount_kopecks, (int, float)) else None
 
-    try:
-        invite_link = _tg_create_invite(product["tg_channel_id"], order_id)
-    except Exception as exc:
-        log.exception("Telegram createChatInviteLink failed: %s", exc)
-        return jsonify({"ok": False, "error": "telegram", "retry": True}), 503
-
-    try:
-        _us_send_email(email, invite_link, product)
-    except Exception as exc:
-        log.exception("UniSender sendEmail failed: %s", exc)
-        return jsonify({"ok": False, "error": "unisender", "retry": True}), 503
-
-    # Atomically запись «куплено» — финальное звено защиты от дублей.
-    try:
-        with _db() as conn:
-            conn.execute(
-                "INSERT INTO buyers (deal_id, product_slug, email, phone, invite_link, amount_rub) VALUES (?,?,?,?,?,?)",
-                (order_id, slug, email, phone, invite_link, amount_rub),
-            )
-    except sqlite3.IntegrityError:
-        # Кто-то параллельно вставил — значит дубль. Не страшно, инвайт+письмо уже ушли,
-        # GPL не должен слать колбэки одновременно для одного заказа.
-        log.warning("Race: buyer %s already in DB", order_id)
-
-    # Дублируем в логи как backup на случай, если БД будет потеряна при редеплое.
-    log.info(
-        "BUYER: order=%s product=%s email=%s phone=%s amount_rub=%s invite=%s",
-        order_id, slug, email, phone, amount_rub, invite_link,
-    )
+    delivery_status = _enqueue_delivery(order_id, slug, email, phone, amount_rub)
     _tg_notify_admin(
         f"✅ <b>Оплата «{html.escape(product['name'])}»</b>\n"
-        f"{html.escape(email)}\n"
-        f"{amount_rub} ₽" + (f"\n📞 {html.escape(phone)}" if phone else "")
+        f"Заказ: <code>{html.escape(order_id)}</code>\n"
+        f"Статус доставки: <code>{html.escape(delivery_status)}</code>"
     )
-    return jsonify({"ok": True}), 200
+    return jsonify({"ok": True, "delivery": delivery_status}), 200
 
 
 @app.route("/health", methods=["GET"])
@@ -500,4 +745,5 @@ def ratelimit_handler(e):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    start_delivery_worker()
     app.run(host="0.0.0.0", port=port, debug=False)
