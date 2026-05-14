@@ -567,6 +567,7 @@ def _finish_delivery(row: dict, invite_link: str) -> None:
     )
     _tg_notify_admin(
         f"✅ <b>Оплата «{html.escape(PRODUCTS[row['product_slug']]['name'])}»</b>\n"
+        f"Email: <code>{html.escape(row['email'])}</code>\n"
         f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
         f"Доступ отправлен"
     )
@@ -618,6 +619,7 @@ def _fail_or_retry_delivery(row: dict, exc: Exception) -> None:
         _send_manual_access_email_best_effort(row)
         _tg_notify_admin(
             f"🔴 <b>Доступ не отправлен</b>\n"
+            f"Email: <code>{html.escape(row['email'])}</code>\n"
             f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
             f"Проверь логи DELIVERY_FAILED"
         )
@@ -979,6 +981,7 @@ def payment_callback():
     delivery_status = _enqueue_delivery(order_id, slug, email, phone, amount_rub)
     _tg_notify_admin(
         f"💰 <b>Получена оплата «{html.escape(product['name'])}»</b>\n"
+        f"Email: <code>{html.escape(email)}</code>\n"
         f"Заказ: <code>{html.escape(order_id)}</code>\n"
         f"Выдаю доступ…"
     )
