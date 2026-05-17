@@ -17,6 +17,7 @@ import html
 import json
 import logging
 import os
+import socket
 import sqlite3
 import threading
 import time
@@ -65,6 +66,13 @@ TG_PROXIES = {"https": TG_PROXY_URL, "http": TG_PROXY_URL} if (TG_PROXY_ENABLED 
 DELIVERY_RETRY_WINDOW_SECONDS = int(os.environ.get("DELIVERY_RETRY_WINDOW_SECONDS", "360"))
 DELIVERY_POLL_INTERVAL_SECONDS = float(os.environ.get("DELIVERY_POLL_INTERVAL_SECONDS", "2"))
 DELIVERY_PROCESSING_STALE_SECONDS = int(os.environ.get("DELIVERY_PROCESSING_STALE_SECONDS", "120"))
+HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("HEALTH_CHECK_INTERVAL_SECONDS", "21600"))
+HEALTH_CHECK_POLL_SECONDS = int(os.environ.get("HEALTH_CHECK_POLL_SECONDS", "60"))
+HEALTH_ALERT_COOLDOWN_SECONDS = int(os.environ.get("HEALTH_ALERT_COOLDOWN_SECONDS", "900"))
+HEALTH_EXTERNAL_URL = os.environ.get(
+    "HEALTH_EXTERNAL_URL",
+    "https://maccake-hotrack-payments-5c4d.twc1.net/health",
+).strip()
 
 IZHEVSK_TZ = timezone(timedelta(hours=5))
 REPORT_HOUR_LOCAL = 22  # 22:00 по Ижевску
@@ -323,8 +331,144 @@ def _build_daily_report() -> str:
     return "\n".join(lines)
 
 
+def _utc_cutoff_seconds_ago(seconds: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _check_db_health() -> tuple[bool, str, dict]:
+    with _db() as conn:
+        conn.execute("SELECT 1").fetchone()
+        queue = dict(conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN status='retrying' THEN 1 ELSE 0 END) AS retrying,
+                SUM(CASE WHEN status='processing' THEN 1 ELSE 0 END) AS processing,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+                SUM(CASE
+                    WHEN status IN ('pending','retrying','processing')
+                     AND created_at <= datetime('now', '-' || ? || ' seconds')
+                    THEN 1 ELSE 0 END) AS stale
+            FROM deliveries
+        """, (DELIVERY_RETRY_WINDOW_SECONDS,)).fetchone())
+        last_failed = conn.execute("""
+            SELECT deal_id, email, last_error, updated_at
+            FROM deliveries
+            WHERE status='failed'
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """).fetchone()
+    for key, value in list(queue.items()):
+        queue[key] = int(value or 0)
+    if last_failed:
+        queue["last_failed"] = dict(last_failed)
+    return True, "ok", queue
+
+
+def _check_external_health() -> tuple[bool | None, str]:
+    if not HEALTH_EXTERNAL_URL:
+        return None, "not configured"
+    try:
+        resp = requests.get(HEALTH_EXTERNAL_URL, timeout=8)
+        if resp.status_code == 200:
+            return True, "200"
+        return False, f"HTTP {resp.status_code}"
+    except Exception as exc:
+        return False, _safe_log_text(exc)[:200]
+
+
+def _collect_health_snapshot() -> dict:
+    problems = []
+    now_izh = datetime.now(IZHEVSK_TZ)
+
+    try:
+        db_ok, db_status, queue = _check_db_health()
+    except Exception as exc:
+        db_ok, db_status, queue = False, _safe_log_text(exc)[:200], {}
+        problems.append(f"DB: {db_status}")
+
+    if not TG_PROXY_ENABLED:
+        problems.append("TG proxy выключен")
+    if TG_PROXY_ENABLED and (not TG_PROXY_URL or not TG_PROXY_URL.startswith("socks5h://")):
+        problems.append("TG proxy URL не socks5h://")
+
+    if queue.get("stale", 0) > 0:
+        problems.append(f"зависшие delivery: {queue['stale']}")
+
+    external_ok, external_status = _check_external_health()
+    if external_ok is False:
+        problems.append(f"external health: {external_status}")
+
+    stats_6h = _stats_since(_utc_cutoff_seconds_ago(6 * 60 * 60)) if db_ok else {
+        "clicks": 0, "payments": 0, "revenue": 0, "failed": 0, "conversion": 0
+    }
+    if stats_6h["failed"]:
+        problems.append(f"ошибок доставки за 6ч: {stats_6h['failed']}")
+
+    return {
+        "ok": not problems,
+        "problems": problems,
+        "now_izh": now_izh,
+        "db_ok": db_ok,
+        "db_status": db_status,
+        "queue": queue,
+        "stats_6h": stats_6h,
+        "external_ok": external_ok,
+        "external_status": external_status,
+    }
+
+
+def _format_health_report(snapshot: dict) -> str:
+    queue = snapshot["queue"]
+    stats_6h = snapshot["stats_6h"]
+    status_icon = "🟢" if snapshot["ok"] else "🔴"
+    status_text = "всё спокойно" if snapshot["ok"] else "есть проблемы"
+    external_line = (
+        f"External /health: {snapshot['external_status']}"
+        if snapshot["external_ok"] is not None
+        else "External /health: не настроен"
+    )
+    lines = [
+        f"{status_icon} <b>Health check · {snapshot['now_izh'].strftime('%d.%m.%Y %H:%M')}</b>",
+        f"Статус: {status_text}",
+        "",
+        f"App: pid={os.getpid()} host={html.escape(socket.gethostname())}",
+        f"DB: {'ok' if snapshot['db_ok'] else html.escape(snapshot['db_status'])}",
+        f"TG proxy: {'enabled' if TG_PROXY_ENABLED else 'off'} · {'socks5h' if TG_PROXY_URL and TG_PROXY_URL.startswith('socks5h://') else 'check url'}",
+        external_line,
+        "",
+        "<b>Delivery queue</b>",
+        (
+            f"pending={queue.get('pending', 0)} · retrying={queue.get('retrying', 0)} · "
+            f"processing={queue.get('processing', 0)} · failed={queue.get('failed', 0)}"
+        ),
+        "",
+        "<b>За последние 6 часов</b>",
+        _fmt_stats_line(stats_6h),
+    ]
+    if snapshot["problems"]:
+        lines.extend(["", "<b>Проблемы</b>"])
+        lines.extend(f"• {html.escape(problem)}" for problem in snapshot["problems"])
+    return "\n".join(lines)
+
+
+def _health_alert_key(snapshot: dict) -> str:
+    problem_text = "|".join(sorted(snapshot["problems"]))
+    digest = hashlib.sha256(problem_text.encode("utf-8")).hexdigest()[:12]
+    bucket = int(time.time() // HEALTH_ALERT_COOLDOWN_SECONDS)
+    return f"health-alert:{digest}:{bucket}"
+
+
+def _six_hour_health_key() -> str:
+    bucket = int(time.time() // HEALTH_CHECK_INTERVAL_SECONDS)
+    return f"health:{bucket}"
+
+
 _report_scheduler_started = False
 _report_scheduler_lock = threading.Lock()
+_health_monitor_started = False
+_health_monitor_lock = threading.Lock()
 
 
 def _try_claim_report(key: str) -> bool:
@@ -371,6 +515,38 @@ def start_report_scheduler() -> None:
         thread.start()
         _report_scheduler_started = True
         log.info("Report scheduler started pid=%s", os.getpid())
+
+
+def _health_monitor_loop() -> None:
+    log.info(
+        "Health monitor started pid=%s interval=%ss alert_cooldown=%ss",
+        os.getpid(),
+        HEALTH_CHECK_INTERVAL_SECONDS,
+        HEALTH_ALERT_COOLDOWN_SECONDS,
+    )
+    while True:
+        try:
+            snapshot = _collect_health_snapshot()
+            if _try_claim_report(_six_hour_health_key()):
+                _tg_notify_admin(_format_health_report(snapshot))
+                log.info("Health check report sent ok=%s", snapshot["ok"])
+            if not snapshot["ok"] and _try_claim_report(_health_alert_key(snapshot)):
+                _tg_notify_admin(_format_health_report(snapshot))
+                log.warning("Health alert sent: %s", "; ".join(snapshot["problems"]))
+        except Exception as exc:
+            log.error("Health monitor error: %s", _safe_log_text(exc))
+        time.sleep(HEALTH_CHECK_POLL_SECONDS)
+
+
+def start_health_monitor() -> None:
+    global _health_monitor_started
+    with _health_monitor_lock:
+        if _health_monitor_started:
+            return
+        thread = threading.Thread(target=_health_monitor_loop, name="health-monitor", daemon=True)
+        thread.start()
+        _health_monitor_started = True
+        log.info("Health monitor thread started pid=%s", os.getpid())
 
 
 # ─────────────────────────── domain ops ───────────────────────────
@@ -1003,4 +1179,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     start_delivery_worker()
     start_report_scheduler()
+    start_health_monitor()
     app.run(host="0.0.0.0", port=port, debug=False)
