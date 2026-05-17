@@ -69,10 +69,7 @@ DELIVERY_PROCESSING_STALE_SECONDS = int(os.environ.get("DELIVERY_PROCESSING_STAL
 HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("HEALTH_CHECK_INTERVAL_SECONDS", "21600"))
 HEALTH_CHECK_POLL_SECONDS = int(os.environ.get("HEALTH_CHECK_POLL_SECONDS", "60"))
 HEALTH_ALERT_COOLDOWN_SECONDS = int(os.environ.get("HEALTH_ALERT_COOLDOWN_SECONDS", "900"))
-HEALTH_EXTERNAL_URL = os.environ.get(
-    "HEALTH_EXTERNAL_URL",
-    "https://maccake-hotrack-payments-5c4d.twc1.net/health",
-).strip()
+HEALTH_EXTERNAL_URL = os.environ.get("HEALTH_EXTERNAL_URL", "").strip()
 
 IZHEVSK_TZ = timezone(timedelta(hours=5))
 REPORT_HOUR_LOCAL = 22  # 22:00 по Ижевску
