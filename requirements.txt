@@ -3,3 +3,4 @@ gunicorn==23.0.0
 requests[socks]==2.32.3
 Flask-Limiter==3.8.0
 boto3==1.35.36
+cryptography==43.0.3

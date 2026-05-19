@@ -13,11 +13,13 @@ Persistent state в SQLite (/app/data/orders.db):
   Для долгосрочного бэкапа покупатели дополнительно пишутся в лог как BUYER:... (TimeWeb хранит логи).
 """
 import hashlib
+import hmac
 import html
 import json
 import logging
 import os
 import gzip
+import base64
 import shutil
 import socket
 import sqlite3
@@ -82,6 +84,8 @@ S3_BACKUP_MIN_INTERVAL_SECONDS = int(os.environ.get("S3_BACKUP_MIN_INTERVAL_SECO
 S3_BACKUP_STALE_SECONDS = int(os.environ.get("S3_BACKUP_STALE_SECONDS", "900"))
 S3_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("S3_CONNECT_TIMEOUT_SECONDS", "5"))
 S3_READ_TIMEOUT_SECONDS = int(os.environ.get("S3_READ_TIMEOUT_SECONDS", "10"))
+S3_BACKUP_ENCRYPTION_KEY = os.environ.get("S3_BACKUP_ENCRYPTION_KEY", "").strip()
+CALLBACK_TOKEN_GRACE_SECONDS = int(os.environ.get("CALLBACK_TOKEN_GRACE_SECONDS", "86400"))
 
 IZHEVSK_TZ = timezone(timedelta(hours=5))
 REPORT_HOUR_LOCAL = 22  # 22:00 по Ижевску
@@ -125,6 +129,7 @@ log = logging.getLogger("payments")
 app = Flask(__name__)
 # TimeWeb's reverse proxy → доверяем X-Forwarded-* (для request.host_url и rate-limit по реальному IP).
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH", "65536"))
 
 # Rate-limit по реальному IP. По умолчанию ничего не лимитирует — только эндпоинты с @limiter.limit.
 limiter = Limiter(get_remote_address, app=app, default_limits=[])
@@ -133,7 +138,8 @@ limiter = Limiter(get_remote_address, app=app, default_limits=[])
 
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-S3_BACKUP_LATEST_KEY = f"{S3_BACKUP_PREFIX}/sqlite/latest/orders.db.gz"
+S3_BACKUP_LATEST_KEY = f"{S3_BACKUP_PREFIX}/sqlite/latest/orders.db.gz.fernet"
+S3_BACKUP_LEGACY_LATEST_KEY = f"{S3_BACKUP_PREFIX}/sqlite/latest/orders.db.gz"
 S3_BACKUP_MANIFEST_KEY = f"{S3_BACKUP_PREFIX}/sqlite/manifest.json"
 _s3_backup_lock = threading.Lock()
 _s3_backup_started = False
@@ -182,6 +188,38 @@ def _s3_client():
     )
 
 
+def _fernet_key() -> bytes:
+    if S3_BACKUP_ENCRYPTION_KEY:
+        return S3_BACKUP_ENCRYPTION_KEY.encode("utf-8")
+    digest = hashlib.sha256((GPL_API_KEY + ":sqlite-s3-backup:v1").encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest)
+
+
+def _encrypt_backup_file(src_path: Path, dst_path: Path) -> None:
+    from cryptography.fernet import Fernet
+
+    encrypted = Fernet(_fernet_key()).encrypt(src_path.read_bytes())
+    dst_path.write_bytes(encrypted)
+
+
+def _decrypt_backup_file(src_path: Path, dst_path: Path) -> None:
+    from cryptography.fernet import Fernet
+
+    decrypted = Fernet(_fernet_key()).decrypt(src_path.read_bytes())
+    dst_path.write_bytes(decrypted)
+
+
+def _download_s3_object_to_file(key: str, dst_path: Path) -> bool:
+    try:
+        _s3_client().download_file(S3_BUCKET, key, str(dst_path))
+        return True
+    except Exception as exc:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code") if hasattr(exc, "response") else None
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return False
+        raise
+
+
 def _set_s3_backup_status(*, ok: bool | None, status: str, error: str | None = None, key: str | None = None) -> None:
     with _s3_backup_lock:
         _s3_backup_last_status.update({
@@ -210,26 +248,35 @@ def _restore_db_from_s3_if_needed() -> None:
     if not _s3_configured() or DB_PATH.exists():
         return
     tmp_dir = Path(tempfile.mkdtemp(prefix="orders-restore-", dir=str(DB_PATH.parent)))
+    encrypted_path = tmp_dir / "orders.db.gz.fernet"
     gz_path = tmp_dir / "orders.db.gz"
     restored_path = tmp_dir / "orders.db"
     try:
         log.info("SQLite DB missing, trying S3 restore from s3://%s/%s", S3_BUCKET, S3_BACKUP_LATEST_KEY)
-        _s3_client().download_file(S3_BUCKET, S3_BACKUP_LATEST_KEY, str(gz_path))
+        restored_encrypted = _download_s3_object_to_file(S3_BACKUP_LATEST_KEY, encrypted_path)
+        if restored_encrypted:
+            _decrypt_backup_file(encrypted_path, gz_path)
+            restored_key = S3_BACKUP_LATEST_KEY
+            restored_status = "restored encrypted latest backup"
+        else:
+            restored_legacy = _download_s3_object_to_file(S3_BACKUP_LEGACY_LATEST_KEY, gz_path)
+            if not restored_legacy:
+                _set_s3_backup_status(ok=None, status="no backup yet")
+                log.info("No S3 SQLite backup yet, starting with empty SQLite DB")
+                return
+            restored_key = S3_BACKUP_LEGACY_LATEST_KEY
+            restored_status = "restored legacy plaintext backup"
         with gzip.open(gz_path, "rb") as src, restored_path.open("wb") as dst:
             shutil.copyfileobj(src, dst)
         os.replace(restored_path, DB_PATH)
-        _set_s3_backup_status(ok=True, status="restored latest backup", key=S3_BACKUP_LATEST_KEY)
+        _set_s3_backup_status(ok=True, status=restored_status, key=restored_key)
         log.info("SQLite DB restored from S3 latest backup")
     except Exception as exc:
         code = getattr(exc, "response", {}).get("Error", {}).get("Code") if hasattr(exc, "response") else None
         error = _mask_secret_text(exc)[:300]
-        if code in {"404", "NoSuchKey", "NotFound"}:
-            _set_s3_backup_status(ok=None, status="no backup yet", error=error)
-            log.info("No S3 SQLite backup yet, starting with empty SQLite DB")
-        else:
-            _s3_restore_blocks_backup = True
-            _set_s3_backup_status(ok=False, status="restore failed; backup blocked", error=error)
-            log.error("S3 restore failed, starting with empty SQLite DB and blocking new backups: %s", error)
+        _s3_restore_blocks_backup = True
+        _set_s3_backup_status(ok=False, status="restore failed; backup blocked", error=error)
+        log.error("S3 restore failed, starting with empty SQLite DB and blocking new backups: %s", error)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -255,6 +302,7 @@ def _perform_s3_backup(reason: str) -> None:
     tmp_dir = Path(tempfile.mkdtemp(prefix="orders-backup-", dir=str(DB_PATH.parent)))
     snapshot_path = tmp_dir / "orders.db"
     gz_path = tmp_dir / "orders.db.gz"
+    encrypted_path = tmp_dir / "orders.db.gz.fernet"
     lock_acquired = False
     try:
         try:
@@ -269,21 +317,23 @@ def _perform_s3_backup(reason: str) -> None:
         _copy_sqlite_db(DB_PATH, snapshot_path)
         with snapshot_path.open("rb") as src, gzip.open(gz_path, "wb") as dst:
             shutil.copyfileobj(src, dst)
-        digest = hashlib.sha256(gz_path.read_bytes()).hexdigest()
+        _encrypt_backup_file(gz_path, encrypted_path)
+        digest = hashlib.sha256(encrypted_path.read_bytes()).hexdigest()
         now = datetime.now(timezone.utc)
         stamp = now.strftime("%Y-%m-%dT%H-%M-%SZ")
-        snapshot_key = f"{S3_BACKUP_PREFIX}/sqlite/snapshots/orders-{stamp}-{os.getpid()}.db.gz"
+        snapshot_key = f"{S3_BACKUP_PREFIX}/sqlite/snapshots/orders-{stamp}-{os.getpid()}.db.gz.fernet"
         manifest = {
             "latest_key": S3_BACKUP_LATEST_KEY,
             "snapshot_key": snapshot_key,
             "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "encryption": "fernet",
             "reason": reason,
-            "sha256_gzip": digest,
-            "size_bytes": gz_path.stat().st_size,
+            "sha256_encrypted": digest,
+            "size_bytes": encrypted_path.stat().st_size,
         }
         s3 = _s3_client()
-        s3.upload_file(str(gz_path), S3_BUCKET, snapshot_key)
-        s3.upload_file(str(gz_path), S3_BUCKET, S3_BACKUP_LATEST_KEY)
+        s3.upload_file(str(encrypted_path), S3_BUCKET, snapshot_key)
+        s3.upload_file(str(encrypted_path), S3_BUCKET, S3_BACKUP_LATEST_KEY)
         s3.put_object(
             Bucket=S3_BUCKET,
             Key=S3_BACKUP_MANIFEST_KEY,
@@ -373,9 +423,15 @@ def _init_db():
                 ip           TEXT,
                 user_agent   TEXT,
                 referer      TEXT,
+                callback_token_required INTEGER NOT NULL DEFAULT 0,
                 created_at   TEXT DEFAULT (datetime('now'))
             )
         """)
+        try:
+            conn.execute("ALTER TABLE orders ADD COLUMN callback_token_required INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
         # buyers — успешно обработанные платежи (запись после TG+UniSender). Single source of truth по покупателям.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS buyers (
@@ -438,6 +494,57 @@ def _normalize_admin_chat_id(value: str | None) -> str | None:
 
 
 ADMIN_CHAT_ID = _normalize_admin_chat_id(ADMIN_CHAT_ID_RAW)
+
+
+def _mask_email(email: str | None) -> str:
+    if not email or "@" not in email:
+        return "-"
+    local, domain = email.split("@", 1)
+    if not local:
+        return f"***@{domain}"
+    if len(local) == 1:
+        masked_local = local[0] + "***"
+    elif len(local) == 2:
+        masked_local = local[0] + "***" + local[-1]
+    else:
+        masked_local = local[:2] + "***" + local[-1]
+    return f"{masked_local}@{domain}"
+
+
+def _callback_token_for(order_id: str) -> str:
+    digest = hmac.new(
+        GPL_API_KEY.encode("utf-8"),
+        f"gpl-callback-v1:{order_id}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest[:48]
+
+
+def _callback_token_valid(order_id: str, token: str | None) -> bool:
+    if not token:
+        return False
+    return hmac.compare_digest(_callback_token_for(order_id), token.strip())
+
+
+def _legacy_callback_allowed(order_id: str) -> bool:
+    """Temporary compatibility for orders created before tokenized callback URLs."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                """
+                SELECT created_at, COALESCE(callback_token_required, 0) AS callback_token_required
+                FROM orders
+                WHERE deal_id=?
+                """,
+                (order_id,),
+            ).fetchone()
+        if not row or int(row["callback_token_required"] or 0):
+            return False
+        created_at = datetime.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created_at).total_seconds() <= CALLBACK_TOKEN_GRACE_SECONDS
+    except Exception as exc:
+        log.warning("Legacy callback compatibility check failed for %s: %s", order_id, _safe_log_text(exc))
+        return False
 
 
 def _safe_log_text(value) -> str:
@@ -807,7 +914,7 @@ def _gpl_init_payment(server_base_url: str, product_slug: str, product: dict) ->
             }
         ],
         "clientParams": {"clientId": client_id},
-        "notificationUrl": f"{server_base_url.rstrip('/')}/payment-callback",
+        "notificationUrl": f"{server_base_url.rstrip('/')}/payment-callback/{_callback_token_for(deal_id)}",
         "successUrl": product["success_url"],
         "failUrl": product["fail_url"],
         # product слаг тоже шлём на случай если БД будет пуста (после деплоя) — fallback на колбэке.
@@ -982,7 +1089,7 @@ def _finish_delivery(row: dict, invite_link: str) -> None:
     _request_s3_backup("delivery sent")
     _tg_notify_admin(
         f"✅ <b>Оплата «{html.escape(PRODUCTS[row['product_slug']]['name'])}»</b>\n"
-        f"Email: <code>{html.escape(row['email'])}</code>\n"
+        f"Email: <code>{html.escape(_mask_email(row['email']))}</code>\n"
         f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
         f"Доступ отправлен"
     )
@@ -1035,7 +1142,7 @@ def _fail_or_retry_delivery(row: dict, exc: Exception) -> None:
         _send_manual_access_email_best_effort(row)
         _tg_notify_admin(
             f"🔴 <b>Доступ не отправлен</b>\n"
-            f"Email: <code>{html.escape(row['email'])}</code>\n"
+            f"Email: <code>{html.escape(_mask_email(row['email']))}</code>\n"
             f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
             f"Проверь логи DELIVERY_FAILED"
         )
@@ -1333,7 +1440,11 @@ def create_payment_for(slug: str):
     try:
         with _db() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO orders (deal_id, product_slug, price_rub, ip, user_agent, referer) VALUES (?,?,?,?,?,?)",
+                """
+                INSERT OR REPLACE INTO orders
+                    (deal_id, product_slug, price_rub, ip, user_agent, referer, callback_token_required)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+                """,
                 (deal_id, slug, product["price_rub"], ip, ua, referer),
             )
         _request_s3_backup("order created")
@@ -1354,7 +1465,8 @@ def create_payment_default():
 
 
 @app.route("/payment-callback", methods=["POST"])
-def payment_callback():
+@app.route("/payment-callback/<callback_token>", methods=["POST"])
+def payment_callback(callback_token: str | None = None):
     callback_ip = request.headers.get("X-Forwarded-For", request.remote_addr)
     raw = request.get_data(as_text=True)
     log.info("Callback from ip=%s body: %s", callback_ip, raw[:2000])
@@ -1370,6 +1482,18 @@ def payment_callback():
         return jsonify({"ok": True, "skipped": "not_success"}), 200
 
     order_id = _extract_order_id(body, raw)
+
+    if not _callback_token_valid(order_id, callback_token):
+        if not callback_token and _legacy_callback_allowed(order_id):
+            log.warning("Accepted legacy unsigned callback for pre-token order %s", order_id)
+        else:
+            log.warning("Rejected callback with bad token for order %s", order_id)
+            _tg_notify_admin(
+                f"🔴 <b>Отклонён callback без защиты</b>\n"
+                f"Заказ: <code>{html.escape(order_id)}</code>\n"
+                f"Доступ не выдавался"
+            )
+            return jsonify({"ok": True, "skipped": "bad_callback_token"}), 200
 
     # Дедуп — атомарно через UNIQUE constraint на buyers.deal_id.
     # Сначала проверим, не обработан ли уже:
@@ -1394,11 +1518,19 @@ def payment_callback():
     phone = _extract_phone(body)
     amount_kopecks = (body.get("paymentData") or {}).get("amount")
     amount_rub = (amount_kopecks / 100) if isinstance(amount_kopecks, (int, float)) else None
+    if amount_rub is not None and amount_rub + 0.01 < product["price_rub"]:
+        log.error("Callback underpaid for order %s: amount_rub=%s expected=%s", order_id, amount_rub, product["price_rub"])
+        _tg_notify_admin(
+            f"🔴 <b>Отклонён callback с неверной суммой</b>\n"
+            f"Заказ: <code>{html.escape(order_id)}</code>\n"
+            f"Сумма: {html.escape(str(amount_rub))} ₽ вместо {product['price_rub']} ₽"
+        )
+        return jsonify({"ok": True, "skipped": "amount_mismatch"}), 200
 
     delivery_status = _enqueue_delivery(order_id, slug, email, phone, amount_rub)
     _tg_notify_admin(
         f"💰 <b>Получена оплата «{html.escape(product['name'])}»</b>\n"
-        f"Email: <code>{html.escape(email)}</code>\n"
+        f"Email: <code>{html.escape(_mask_email(email))}</code>\n"
         f"Заказ: <code>{html.escape(order_id)}</code>\n"
         f"Выдаю доступ…"
     )
