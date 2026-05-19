@@ -17,8 +17,11 @@ import html
 import json
 import logging
 import os
+import gzip
+import shutil
 import socket
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -70,6 +73,15 @@ HEALTH_CHECK_INTERVAL_SECONDS = int(os.environ.get("HEALTH_CHECK_INTERVAL_SECOND
 HEALTH_CHECK_POLL_SECONDS = int(os.environ.get("HEALTH_CHECK_POLL_SECONDS", "60"))
 HEALTH_ALERT_COOLDOWN_SECONDS = int(os.environ.get("HEALTH_ALERT_COOLDOWN_SECONDS", "900"))
 HEALTH_EXTERNAL_URL = os.environ.get("HEALTH_EXTERNAL_URL", "").strip()
+S3_BACKUP_ENABLED = os.environ.get("S3_BACKUP_ENABLED") == "1"
+S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL", "https://s3.twcstorage.ru").strip()
+S3_REGION = os.environ.get("S3_REGION", "ru-1").strip()
+S3_BACKUP_PREFIX = os.environ.get("S3_BACKUP_PREFIX", "hottrailpay").strip().strip("/") or "hottrailpay"
+S3_BACKUP_MIN_INTERVAL_SECONDS = int(os.environ.get("S3_BACKUP_MIN_INTERVAL_SECONDS", "60"))
+S3_BACKUP_STALE_SECONDS = int(os.environ.get("S3_BACKUP_STALE_SECONDS", "900"))
+S3_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("S3_CONNECT_TIMEOUT_SECONDS", "5"))
+S3_READ_TIMEOUT_SECONDS = int(os.environ.get("S3_READ_TIMEOUT_SECONDS", "10"))
 
 IZHEVSK_TZ = timezone(timedelta(hours=5))
 REPORT_HOUR_LOCAL = 22  # 22:00 по Ижевску
@@ -120,6 +132,222 @@ limiter = Limiter(get_remote_address, app=app, default_limits=[])
 # ─────────────────────────── DB ───────────────────────────────
 
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+S3_BACKUP_LATEST_KEY = f"{S3_BACKUP_PREFIX}/sqlite/latest/orders.db.gz"
+S3_BACKUP_MANIFEST_KEY = f"{S3_BACKUP_PREFIX}/sqlite/manifest.json"
+_s3_backup_lock = threading.Lock()
+_s3_backup_started = False
+_s3_backup_requested = threading.Event()
+_s3_backup_last_attempt_at = 0.0
+_s3_backup_dirty = False
+_s3_restore_blocks_backup = False
+_s3_backup_last_status = {
+    "enabled": S3_BACKUP_ENABLED,
+    "ok": None,
+    "status": "disabled" if not S3_BACKUP_ENABLED else "not checked",
+    "last_success_at": None,
+    "last_error": None,
+    "last_key": None,
+}
+
+
+def _mask_secret_text(value) -> str:
+    text = str(value)
+    replacements = [
+        TG_BOT_TOKEN,
+        ADMIN_BOT_TOKEN,
+        TG_PROXY_URL,
+        os.environ.get("AWS_ACCESS_KEY_ID"),
+        os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    ]
+    for secret in replacements:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _s3_client():
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT_URL,
+        region_name=S3_REGION,
+        config=Config(
+            connect_timeout=S3_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=S3_READ_TIMEOUT_SECONDS,
+            retries={"max_attempts": 2, "mode": "standard"},
+        ),
+    )
+
+
+def _set_s3_backup_status(*, ok: bool | None, status: str, error: str | None = None, key: str | None = None) -> None:
+    with _s3_backup_lock:
+        _s3_backup_last_status.update({
+            "enabled": S3_BACKUP_ENABLED,
+            "ok": ok,
+            "status": status,
+            "last_error": error,
+        })
+        if ok:
+            _s3_backup_last_status["last_success_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        if key:
+            _s3_backup_last_status["last_key"] = key
+
+
+def _get_s3_backup_status() -> dict:
+    with _s3_backup_lock:
+        return dict(_s3_backup_last_status)
+
+
+def _s3_configured() -> bool:
+    return S3_BACKUP_ENABLED and bool(S3_BUCKET)
+
+
+def _restore_db_from_s3_if_needed() -> None:
+    global _s3_restore_blocks_backup
+    if not _s3_configured() or DB_PATH.exists():
+        return
+    tmp_dir = Path(tempfile.mkdtemp(prefix="orders-restore-", dir=str(DB_PATH.parent)))
+    gz_path = tmp_dir / "orders.db.gz"
+    restored_path = tmp_dir / "orders.db"
+    try:
+        log.info("SQLite DB missing, trying S3 restore from s3://%s/%s", S3_BUCKET, S3_BACKUP_LATEST_KEY)
+        _s3_client().download_file(S3_BUCKET, S3_BACKUP_LATEST_KEY, str(gz_path))
+        with gzip.open(gz_path, "rb") as src, restored_path.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+        os.replace(restored_path, DB_PATH)
+        _set_s3_backup_status(ok=True, status="restored latest backup", key=S3_BACKUP_LATEST_KEY)
+        log.info("SQLite DB restored from S3 latest backup")
+    except Exception as exc:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code") if hasattr(exc, "response") else None
+        error = _mask_secret_text(exc)[:300]
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            _set_s3_backup_status(ok=None, status="no backup yet", error=error)
+            log.info("No S3 SQLite backup yet, starting with empty SQLite DB")
+        else:
+            _s3_restore_blocks_backup = True
+            _set_s3_backup_status(ok=False, status="restore failed; backup blocked", error=error)
+            log.error("S3 restore failed, starting with empty SQLite DB and blocking new backups: %s", error)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _copy_sqlite_db(src_path: Path, dst_path: Path) -> None:
+    src = sqlite3.connect(str(src_path), timeout=10)
+    dst = sqlite3.connect(str(dst_path), timeout=10)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
+def _perform_s3_backup(reason: str) -> None:
+    if not _s3_configured() or not DB_PATH.exists():
+        return
+    if _s3_restore_blocks_backup:
+        log.warning("S3 backup skipped because startup restore failed")
+        return
+    lock_path = DB_PATH.parent / ".orders-s3-backup.lock"
+    lock_file = lock_path.open("a+")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="orders-backup-", dir=str(DB_PATH.parent)))
+    snapshot_path = tmp_dir / "orders.db"
+    gz_path = tmp_dir / "orders.db.gz"
+    lock_acquired = False
+    try:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_acquired = True
+        except BlockingIOError:
+            log.info("S3 backup skipped: another worker is backing up")
+            return
+
+        _copy_sqlite_db(DB_PATH, snapshot_path)
+        with snapshot_path.open("rb") as src, gzip.open(gz_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        digest = hashlib.sha256(gz_path.read_bytes()).hexdigest()
+        now = datetime.now(timezone.utc)
+        stamp = now.strftime("%Y-%m-%dT%H-%M-%SZ")
+        snapshot_key = f"{S3_BACKUP_PREFIX}/sqlite/snapshots/orders-{stamp}-{os.getpid()}.db.gz"
+        manifest = {
+            "latest_key": S3_BACKUP_LATEST_KEY,
+            "snapshot_key": snapshot_key,
+            "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "reason": reason,
+            "sha256_gzip": digest,
+            "size_bytes": gz_path.stat().st_size,
+        }
+        s3 = _s3_client()
+        s3.upload_file(str(gz_path), S3_BUCKET, snapshot_key)
+        s3.upload_file(str(gz_path), S3_BUCKET, S3_BACKUP_LATEST_KEY)
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=S3_BACKUP_MANIFEST_KEY,
+            Body=json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
+        _set_s3_backup_status(ok=True, status="ok", key=snapshot_key)
+        log.info("S3 backup ok reason=%s key=%s size=%s", reason, snapshot_key, manifest["size_bytes"])
+    except Exception as exc:
+        error = _mask_secret_text(exc)[:300]
+        _set_s3_backup_status(ok=False, status="backup failed", error=error)
+        log.error("S3 backup failed reason=%s error=%s", reason, error)
+    finally:
+        if lock_acquired:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        lock_file.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _s3_backup_loop() -> None:
+    global _s3_backup_dirty, _s3_backup_last_attempt_at
+    log.info("S3 backup worker started enabled=%s bucket=%s prefix=%s", S3_BACKUP_ENABLED, S3_BUCKET or "-", S3_BACKUP_PREFIX)
+    while True:
+        _s3_backup_requested.wait(timeout=30)
+        _s3_backup_requested.clear()
+        now = time.time()
+        with _s3_backup_lock:
+            dirty = _s3_backup_dirty
+            enough_time_passed = now - _s3_backup_last_attempt_at >= S3_BACKUP_MIN_INTERVAL_SECONDS
+            if not dirty or not enough_time_passed:
+                continue
+            _s3_backup_dirty = False
+            _s3_backup_last_attempt_at = now
+        _perform_s3_backup("background")
+
+
+def start_s3_backup_worker() -> None:
+    global _s3_backup_dirty, _s3_backup_started
+    if not _s3_configured():
+        return
+    with _s3_backup_lock:
+        if _s3_backup_started:
+            return
+        thread = threading.Thread(target=_s3_backup_loop, name="s3-backup", daemon=True)
+        thread.start()
+        _s3_backup_started = True
+        _s3_backup_dirty = True
+        _s3_backup_requested.set()
+
+
+def _request_s3_backup(reason: str) -> None:
+    global _s3_backup_dirty
+    if not _s3_configured():
+        return
+    start_s3_backup_worker()
+    with _s3_backup_lock:
+        _s3_backup_dirty = True
+    log.info("S3 backup requested reason=%s", reason)
+    _s3_backup_requested.set()
 
 
 @contextmanager
@@ -188,7 +416,7 @@ def _init_db():
             )
         """)
 
-
+_restore_db_from_s3_if_needed()
 _init_db()
 
 # ─────────────────────────── HTTP helpers ───────────────────────────
@@ -213,12 +441,7 @@ ADMIN_CHAT_ID = _normalize_admin_chat_id(ADMIN_CHAT_ID_RAW)
 
 
 def _safe_log_text(value) -> str:
-    text = str(value)
-    replacements = [TG_BOT_TOKEN, ADMIN_BOT_TOKEN, TG_PROXY_URL]
-    for secret in replacements:
-        if secret:
-            text = text.replace(secret, "***")
-    return text
+    return _mask_secret_text(value)
 
 
 def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
@@ -403,6 +626,20 @@ def _collect_health_snapshot() -> dict:
     if stats_6h["failed"]:
         problems.append(f"ошибок доставки за 6ч: {stats_6h['failed']}")
 
+    s3_backup = _get_s3_backup_status()
+    if S3_BACKUP_ENABLED and not S3_BUCKET:
+        problems.append("S3 backup включён, но S3_BUCKET пустой")
+    if S3_BACKUP_ENABLED and s3_backup.get("ok") is False:
+        problems.append(f"S3 backup: {s3_backup.get('status')}")
+    if S3_BACKUP_ENABLED and s3_backup.get("last_success_at"):
+        try:
+            last_success = datetime.strptime(s3_backup["last_success_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - last_success).total_seconds()
+            if age > S3_BACKUP_STALE_SECONDS and stats_6h["clicks"]:
+                problems.append(f"S3 backup старше {int(age // 60)} мин")
+        except Exception:
+            pass
+
     return {
         "ok": not problems,
         "problems": problems,
@@ -413,12 +650,14 @@ def _collect_health_snapshot() -> dict:
         "stats_6h": stats_6h,
         "external_ok": external_ok,
         "external_status": external_status,
+        "s3_backup": s3_backup,
     }
 
 
 def _format_health_report(snapshot: dict) -> str:
     queue = snapshot["queue"]
     stats_6h = snapshot["stats_6h"]
+    s3_backup = snapshot["s3_backup"]
     status_icon = "🟢" if snapshot["ok"] else "🔴"
     status_text = "всё спокойно" if snapshot["ok"] else "есть проблемы"
     external_line = (
@@ -432,6 +671,7 @@ def _format_health_report(snapshot: dict) -> str:
         "",
         f"App: pid={os.getpid()} host={html.escape(socket.gethostname())}",
         f"DB: {'ok' if snapshot['db_ok'] else html.escape(snapshot['db_status'])}",
+        f"S3 backup: {html.escape(s3_backup['status'])}" + (f" · {html.escape(s3_backup['last_success_at'])} UTC" if s3_backup.get("last_success_at") else ""),
         f"TG proxy: {'enabled' if TG_PROXY_ENABLED else 'off'} · {'socks5h' if TG_PROXY_URL and TG_PROXY_URL.startswith('socks5h://') else 'check url'}",
         external_line,
         "",
@@ -623,6 +863,7 @@ def _enqueue_delivery(order_id: str, slug: str, email: str, phone: str | None, a
         row = conn.execute("SELECT status FROM deliveries WHERE deal_id=?", (order_id,)).fetchone()
     status = row["status"] if row else "unknown"
     log.info("DELIVERY_QUEUED: order=%s product=%s email=%s phone=%s amount_rub=%s status=%s", order_id, slug, email, phone, amount_rub, status)
+    _request_s3_backup("delivery queued")
     return status
 
 
@@ -738,6 +979,7 @@ def _finish_delivery(row: dict, invite_link: str) -> None:
         "BUYER: order=%s product=%s email=%s phone=%s amount_rub=%s invite=%s",
         row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], invite_link,
     )
+    _request_s3_backup("delivery sent")
     _tg_notify_admin(
         f"✅ <b>Оплата «{html.escape(PRODUCTS[row['product_slug']]['name'])}»</b>\n"
         f"Email: <code>{html.escape(row['email'])}</code>\n"
@@ -785,6 +1027,7 @@ def _fail_or_retry_delivery(row: dict, exc: Exception) -> None:
             )
 
     if status == "failed":
+        _request_s3_backup("delivery failed")
         log.error(
             "DELIVERY_FAILED: order=%s product=%s email=%s phone=%s amount_rub=%s attempts=%s error=%s",
             row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], attempts, error,
@@ -1093,6 +1336,7 @@ def create_payment_for(slug: str):
                 "INSERT OR REPLACE INTO orders (deal_id, product_slug, price_rub, ip, user_agent, referer) VALUES (?,?,?,?,?,?)",
                 (deal_id, slug, product["price_rub"], ip, ua, referer),
             )
+        _request_s3_backup("order created")
     except Exception as exc:
         log.exception("Failed to record order %s in DB: %s", deal_id, exc)
         # Не валим оплату из-за БД — fallback по customParams.product сработает.
@@ -1175,6 +1419,7 @@ def ratelimit_handler(e):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     start_delivery_worker()
+    start_s3_backup_worker()
     start_report_scheduler()
     start_health_monitor()
     app.run(host="0.0.0.0", port=port, debug=False)
