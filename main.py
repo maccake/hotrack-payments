@@ -220,7 +220,14 @@ def _download_s3_object_to_file(key: str, dst_path: Path) -> bool:
         raise
 
 
-def _set_s3_backup_status(*, ok: bool | None, status: str, error: str | None = None, key: str | None = None) -> None:
+def _set_s3_backup_status(
+    *,
+    ok: bool | None,
+    status: str,
+    error: str | None = None,
+    key: str | None = None,
+    success_at: str | None = None,
+) -> None:
     with _s3_backup_lock:
         _s3_backup_last_status.update({
             "enabled": S3_BACKUP_ENABLED,
@@ -229,12 +236,30 @@ def _set_s3_backup_status(*, ok: bool | None, status: str, error: str | None = N
             "last_error": error,
         })
         if ok:
-            _s3_backup_last_status["last_success_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            _s3_backup_last_status["last_success_at"] = success_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         if key:
             _s3_backup_last_status["last_key"] = key
 
 
+def _refresh_s3_backup_status_from_manifest() -> None:
+    if not _s3_configured():
+        return
+    try:
+        obj = _s3_client().get_object(Bucket=S3_BUCKET, Key=S3_BACKUP_MANIFEST_KEY)
+        manifest = json.loads(obj["Body"].read().decode("utf-8"))
+        created_at = manifest.get("created_at")
+        key = manifest.get("snapshot_key") or manifest.get("latest_key")
+        if created_at:
+            _set_s3_backup_status(ok=True, status="ok", key=key, success_at=created_at)
+    except Exception as exc:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code") if hasattr(exc, "response") else None
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return
+        _set_s3_backup_status(ok=False, status="manifest check failed", error=_mask_secret_text(exc)[:300])
+
+
 def _get_s3_backup_status() -> dict:
+    _refresh_s3_backup_status_from_manifest()
     with _s3_backup_lock:
         return dict(_s3_backup_last_status)
 
@@ -340,7 +365,7 @@ def _perform_s3_backup(reason: str) -> None:
             Body=json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8"),
             ContentType="application/json; charset=utf-8",
         )
-        _set_s3_backup_status(ok=True, status="ok", key=snapshot_key)
+        _set_s3_backup_status(ok=True, status="ok", key=snapshot_key, success_at=manifest["created_at"])
         log.info("S3 backup ok reason=%s key=%s size=%s", reason, snapshot_key, manifest["size_bytes"])
     except Exception as exc:
         error = _mask_secret_text(exc)[:300]
@@ -686,10 +711,21 @@ def _check_db_health() -> tuple[bool, str, dict]:
             ORDER BY updated_at DESC
             LIMIT 1
         """).fetchone()
+        latest_change_at = conn.execute("""
+            SELECT MAX(ts) AS latest_change_at
+            FROM (
+                SELECT created_at AS ts FROM orders
+                UNION ALL
+                SELECT completed_at AS ts FROM buyers
+                UNION ALL
+                SELECT updated_at AS ts FROM deliveries
+            )
+        """).fetchone()["latest_change_at"]
     for key, value in list(queue.items()):
         queue[key] = int(value or 0)
     if last_failed:
         queue["last_failed"] = dict(last_failed)
+    queue["latest_change_at"] = latest_change_at
     return True, "ok", queue
 
 
@@ -741,9 +777,12 @@ def _collect_health_snapshot() -> dict:
     if S3_BACKUP_ENABLED and s3_backup.get("last_success_at"):
         try:
             last_success = datetime.strptime(s3_backup["last_success_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            latest_change = queue.get("latest_change_at")
             age = (datetime.now(timezone.utc) - last_success).total_seconds()
-            if age > S3_BACKUP_STALE_SECONDS and stats_6h["clicks"]:
-                problems.append(f"S3 backup старше {int(age // 60)} мин")
+            if latest_change:
+                latest_db_change = datetime.strptime(latest_change, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                if latest_db_change > last_success + timedelta(seconds=5) and age > S3_BACKUP_STALE_SECONDS:
+                    problems.append(f"S3 backup не обновлялся после изменений в базе {int(age // 60)} мин")
         except Exception:
             pass
 
