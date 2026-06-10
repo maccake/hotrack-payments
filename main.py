@@ -86,9 +86,11 @@ S3_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("S3_CONNECT_TIMEOUT_SECONDS", "5
 S3_READ_TIMEOUT_SECONDS = int(os.environ.get("S3_READ_TIMEOUT_SECONDS", "10"))
 S3_BACKUP_ENCRYPTION_KEY = os.environ.get("S3_BACKUP_ENCRYPTION_KEY", "").strip()
 CALLBACK_TOKEN_GRACE_SECONDS = int(os.environ.get("CALLBACK_TOKEN_GRACE_SECONDS", "86400"))
+TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "").strip()
 
-IZHEVSK_TZ = timezone(timedelta(hours=5))
-REPORT_HOUR_LOCAL = 22  # 22:00 по Ижевску
+REPORT_TZ = timezone(timedelta(hours=3))
+REPORT_TZ_LABEL = "МСК"
+REPORT_HOUR_LOCAL = 22  # 22:00 по МСК
 
 # ─────────────────────────── PRODUCTS REGISTRY ───────────────────────────
 # Чтобы добавить продукт: новый ключ в PRODUCTS, обновить кнопку в Tilda на /p/<slug>/create-payment.
@@ -496,6 +498,27 @@ def _init_db():
                 sent_at    TEXT DEFAULT (datetime('now'))
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_messages (
+                message_key TEXT PRIMARY KEY,
+                chat_id     TEXT NOT NULL,
+                message_id  INTEGER NOT NULL,
+                updated_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS telegram_joins (
+                deal_id          TEXT PRIMARY KEY,
+                product_slug     TEXT,
+                email            TEXT,
+                telegram_user_id INTEGER NOT NULL,
+                telegram_username TEXT,
+                telegram_name    TEXT,
+                invite_link      TEXT,
+                joined_at        TEXT DEFAULT (datetime('now')),
+                updated_at       TEXT DEFAULT (datetime('now'))
+            )
+        """)
 
 _restore_db_from_s3_if_needed()
 _init_db()
@@ -600,10 +623,10 @@ def _post_with_retry(url, *, attempts=3, base_delay=1.0, **kwargs):
 
 # ─────────────────────────── admin notifications (best-effort) ───────────────────────────
 
-def _tg_notify_admin(text: str) -> None:
+def _tg_notify_admin(text: str) -> int | None:
     """Отправить сообщение в админ-канал. НИКОГДА не должна валить основной флоу."""
     if not ADMIN_BOT_TOKEN or not ADMIN_CHAT_ID:
-        return
+        return None
     try:
         url = f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/sendMessage"
         resp = requests.post(
@@ -614,8 +637,102 @@ def _tg_notify_admin(text: str) -> None:
         )
         if resp.status_code >= 400:
             log.warning("Admin notify failed: %d %s", resp.status_code, _safe_log_text(resp.text[:500]))
+            return None
+        data = resp.json()
+        return (data.get("result") or {}).get("message_id") if data.get("ok") else None
     except Exception as exc:
         log.warning("Admin notify failed (non-critical): %s", _safe_log_text(exc))
+        return None
+
+
+def _tg_edit_admin_message(message_id: int, text: str) -> bool:
+    """Обновить админ-сообщение. Ошибки не должны влиять на оплату или delivery."""
+    if not ADMIN_BOT_TOKEN or not ADMIN_CHAT_ID:
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{ADMIN_BOT_TOKEN}/editMessageText"
+        resp = requests.post(
+            url,
+            json={
+                "chat_id": ADMIN_CHAT_ID,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=5,
+            proxies=TG_PROXIES,
+        )
+        if resp.status_code >= 400:
+            if resp.status_code == 400 and "message is not modified" in resp.text.lower():
+                return True
+            log.warning("Admin edit failed: %d %s", resp.status_code, _safe_log_text(resp.text[:500]))
+            return False
+        return bool(resp.json().get("ok"))
+    except Exception as exc:
+        log.warning("Admin edit failed (non-critical): %s", _safe_log_text(exc))
+        return False
+
+
+def _save_admin_message(message_key: str, message_id: int) -> None:
+    if not ADMIN_CHAT_ID:
+        return
+    with _db() as conn:
+        conn.execute(
+            """
+            INSERT INTO admin_messages (message_key, chat_id, message_id, updated_at)
+            VALUES (?, ?, ?, datetime('now'))
+            ON CONFLICT(message_key) DO UPDATE SET
+                chat_id=excluded.chat_id,
+                message_id=excluded.message_id,
+                updated_at=datetime('now')
+            """,
+            (message_key, str(ADMIN_CHAT_ID), message_id),
+        )
+
+
+def _get_admin_message_id(message_key: str) -> int | None:
+    with _db() as conn:
+        row = conn.execute("SELECT message_id FROM admin_messages WHERE message_key=?", (message_key,)).fetchone()
+    return int(row["message_id"]) if row else None
+
+
+def _tg_upsert_admin_message(message_key: str, text: str) -> int | None:
+    """Отредактировать известное сообщение или отправить новое и запомнить его."""
+    message_id = _get_admin_message_id(message_key)
+    if message_id and _tg_edit_admin_message(message_id, text):
+        return message_id
+    claim_key = f"admin-message:{message_key}"
+    if not message_id and not _try_claim_report(claim_key):
+        time.sleep(0.2)
+        message_id = _get_admin_message_id(message_key)
+        if message_id and _tg_edit_admin_message(message_id, text):
+            return message_id
+        return None
+    message_id = _tg_notify_admin(text)
+    if message_id:
+        _save_admin_message(message_key, message_id)
+    else:
+        _release_report_claim(claim_key)
+    return message_id
+
+
+def _local_now() -> datetime:
+    return datetime.now(REPORT_TZ)
+
+
+def _utc_to_local_text(value: str | None) -> str:
+    if not value:
+        return "-"
+    try:
+        dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return f"{dt.astimezone(REPORT_TZ).strftime('%d.%m.%Y %H:%M')} {REPORT_TZ_LABEL}"
+    except Exception:
+        return html.escape(str(value))
+
+
+def _today_key(prefix: str) -> str:
+    return f"{prefix}:{_local_now().strftime('%Y-%m-%d')}"
 
 
 # ─────────────────────────── daily/weekly/monthly reports ───────────────────────────
@@ -635,15 +752,15 @@ def _stats_since(cutoff_utc: str) -> dict:
     }
 
 
-def _izh_day_start_utc(days_ago: int = 0) -> str:
-    now_izh = datetime.now(IZHEVSK_TZ)
-    day = (now_izh - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
+def _local_day_start_utc(days_ago: int = 0) -> str:
+    now_local = _local_now()
+    day = (now_local - timedelta(days=days_ago)).replace(hour=0, minute=0, second=0, microsecond=0)
     return day.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _izh_month_start_utc() -> str:
-    now_izh = datetime.now(IZHEVSK_TZ)
-    month_start = now_izh.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+def _local_month_start_utc() -> str:
+    now_local = _local_now()
+    month_start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     return month_start.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -655,29 +772,29 @@ def _fmt_stats_line(s: dict) -> str:
     line = f"Кликов: {s['clicks']} · Оплат: {s['payments']} · Конверсия: {s['conversion']}%"
     line += f"\nВыручка: {_fmt_money(s['revenue'])}"
     if s["failed"]:
-        line += f"\n⚠️ Ошибок доставки: {s['failed']}"
+        line += f"\nОшибок доставки: {s['failed']}"
     return line
 
 
 def _build_daily_report() -> str:
-    now_izh = datetime.now(IZHEVSK_TZ)
-    day = _stats_since(_izh_day_start_utc(0))
-    week = _stats_since(_izh_day_start_utc(6))
-    month = _stats_since(_izh_month_start_utc())
+    now_local = _local_now()
+    day = _stats_since(_local_day_start_utc(0))
+    week = _stats_since(_local_day_start_utc(6))
+    month = _stats_since(_local_month_start_utc())
 
     months_ru = {1: "январь", 2: "февраль", 3: "март", 4: "апрель", 5: "май", 6: "июнь",
                  7: "июль", 8: "август", 9: "сентябрь", 10: "октябрь", 11: "ноябрь", 12: "декабрь"}
 
     lines = [
-        f"📊 <b>Сводка · {now_izh.strftime('%d.%m.%Y')}</b>",
+        f"<b>Сводка · {now_local.strftime('%d.%m.%Y')} {REPORT_TZ_LABEL}</b>",
         "",
-        f"<b>▸ Сегодня</b>",
+        f"<b>Сегодня</b>",
         _fmt_stats_line(day),
         "",
-        f"<b>▸ 7 дней</b>",
+        f"<b>7 дней</b>",
         _fmt_stats_line(week),
         "",
-        f"<b>▸ {months_ru.get(now_izh.month, str(now_izh.month))}</b>",
+        f"<b>{months_ru.get(now_local.month, str(now_local.month))}</b>",
         _fmt_stats_line(month),
     ]
     return "\n".join(lines)
@@ -743,7 +860,7 @@ def _check_external_health() -> tuple[bool | None, str]:
 
 def _collect_health_snapshot() -> dict:
     problems = []
-    now_izh = datetime.now(IZHEVSK_TZ)
+    now_local = _local_now()
 
     try:
         db_ok, db_status, queue = _check_db_health()
@@ -789,7 +906,7 @@ def _collect_health_snapshot() -> dict:
     return {
         "ok": not problems,
         "problems": problems,
-        "now_izh": now_izh,
+        "now_local": now_local,
         "db_ok": db_ok,
         "db_status": db_status,
         "queue": queue,
@@ -804,7 +921,6 @@ def _format_health_report(snapshot: dict) -> str:
     queue = snapshot["queue"]
     stats_6h = snapshot["stats_6h"]
     s3_backup = snapshot["s3_backup"]
-    status_icon = "🟢" if snapshot["ok"] else "🔴"
     status_text = "всё спокойно" if snapshot["ok"] else "есть проблемы"
     external_line = (
         f"External /health: {snapshot['external_status']}"
@@ -812,7 +928,7 @@ def _format_health_report(snapshot: dict) -> str:
         else "External /health: не настроен"
     )
     lines = [
-        f"{status_icon} <b>Health check · {snapshot['now_izh'].strftime('%d.%m.%Y %H:%M')}</b>",
+        f"<b>Health check · {snapshot['now_local'].strftime('%d.%m.%Y %H:%M')} {REPORT_TZ_LABEL}</b>",
         f"Статус: {status_text}",
         "",
         f"App: pid={os.getpid()} host={html.escape(socket.gethostname())}",
@@ -843,11 +959,6 @@ def _health_alert_key(snapshot: dict) -> str:
     return f"health-alert:{digest}:{bucket}"
 
 
-def _six_hour_health_key() -> str:
-    bucket = int(time.time() // HEALTH_CHECK_INTERVAL_SECONDS)
-    return f"health:{bucket}"
-
-
 _report_scheduler_started = False
 _report_scheduler_lock = threading.Lock()
 _health_monitor_started = False
@@ -873,14 +984,22 @@ def _try_claim_report(key: str) -> bool:
         conn.close()
 
 
+def _release_report_claim(key: str) -> None:
+    try:
+        with _db() as conn:
+            conn.execute("DELETE FROM report_log WHERE report_key=?", (key,))
+    except Exception as exc:
+        log.warning("Failed to release report claim %s: %s", key, _safe_log_text(exc))
+
+
 def _report_scheduler_loop() -> None:
-    log.info("Report scheduler started pid=%s (daily at %d:00 Izhevsk / %d:00 UTC)", os.getpid(), REPORT_HOUR_LOCAL, (REPORT_HOUR_LOCAL - 5) % 24)
+    log.info("Report scheduler started pid=%s (daily at %d:00 %s / %d:00 UTC)", os.getpid(), REPORT_HOUR_LOCAL, REPORT_TZ_LABEL, (REPORT_HOUR_LOCAL - 3) % 24)
     while True:
         try:
-            now_izh = datetime.now(IZHEVSK_TZ)
-            date_key = now_izh.strftime("%Y-%m-%d")
+            now_local = _local_now()
+            date_key = now_local.strftime("%Y-%m-%d")
             report_key = f"daily:{date_key}"
-            if now_izh.hour == REPORT_HOUR_LOCAL and _try_claim_report(report_key):
+            if now_local.hour == REPORT_HOUR_LOCAL and _try_claim_report(report_key):
                 report = _build_daily_report()
                 _tg_notify_admin(report)
                 log.info("Daily report sent for %s", date_key)
@@ -910,9 +1029,11 @@ def _health_monitor_loop() -> None:
     while True:
         try:
             snapshot = _collect_health_snapshot()
-            if _try_claim_report(_six_hour_health_key()):
-                _tg_notify_admin(_format_health_report(snapshot))
+            if _try_claim_report(_today_key("health")):
+                _tg_upsert_admin_message(_today_key("health-message"), _format_health_report(snapshot))
                 log.info("Health check report sent ok=%s", snapshot["ok"])
+            else:
+                _tg_upsert_admin_message(_today_key("health-message"), _format_health_report(snapshot))
             if not snapshot["ok"] and _try_claim_report(_health_alert_key(snapshot)):
                 _tg_notify_admin(_format_health_report(snapshot))
                 log.warning("Health alert sent: %s", "; ".join(snapshot["problems"]))
@@ -990,6 +1111,205 @@ def _tg_create_invite(channel_id: int, order_id: str, *, attempts: int = 5, time
     return data["result"]["invite_link"]
 
 
+def _admin_payment_key(deal_id: str) -> str:
+    return f"payment:{deal_id}"
+
+
+def _payment_admin_message(
+    *,
+    deal_id: str,
+    product_slug: str,
+    email: str,
+    phone: str | None,
+    amount_rub: float | None,
+    payment_at_utc: str | None,
+    access_status: str,
+    delivered_at_utc: str | None = None,
+    joined_at_utc: str | None = None,
+    telegram_user_id: int | None = None,
+    telegram_username: str | None = None,
+) -> str:
+    product = PRODUCTS.get(product_slug, {})
+    lines = [
+        "<b>Оплата получена</b>",
+        "",
+        f"Продукт: {html.escape(product.get('name', product_slug))}",
+        f"Сумма: {_fmt_money(amount_rub or product.get('price_rub', 0))}",
+        f"Email: <code>{html.escape(_mask_email(email))}</code>",
+    ]
+    if phone:
+        lines.append(f"Телефон: <code>{html.escape(phone)}</code>")
+    lines.extend([
+        f"Заказ: <code>{html.escape(deal_id)}</code>",
+        f"Оплачено: {_utc_to_local_text(payment_at_utc)}",
+        f"Доступ: {html.escape(access_status)}",
+    ])
+    if delivered_at_utc:
+        lines.append(f"Выдано: {_utc_to_local_text(delivered_at_utc)}")
+    if joined_at_utc:
+        tg_text = str(telegram_user_id) if telegram_user_id else "-"
+        if telegram_username:
+            tg_text += f" @{telegram_username}"
+        lines.extend([
+            "Вступление: да",
+            f"Вступил: {_utc_to_local_text(joined_at_utc)}",
+            f"Telegram: <code>{html.escape(tg_text)}</code>",
+        ])
+    else:
+        lines.append("Вступление: нет")
+    return "\n".join(lines)
+
+
+def _refresh_payment_admin_message(deal_id: str) -> None:
+    """Собрать актуальный статус оплаты/выдачи/вступления и обновить одно админ-сообщение."""
+    with _db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                d.deal_id,
+                d.product_slug,
+                d.email,
+                d.phone,
+                d.amount_rub,
+                d.status AS delivery_status,
+                d.created_at AS payment_at,
+                d.updated_at AS delivery_updated_at,
+                b.completed_at AS delivered_at,
+                j.telegram_user_id,
+                j.telegram_username,
+                j.joined_at
+            FROM deliveries d
+            LEFT JOIN buyers b ON b.deal_id=d.deal_id
+            LEFT JOIN telegram_joins j ON j.deal_id=d.deal_id
+            WHERE d.deal_id=?
+            """,
+            (deal_id,),
+        ).fetchone()
+    if not row:
+        return
+    status_map = {
+        "pending": "в очереди",
+        "retrying": "повторная попытка",
+        "processing": "выдаем",
+        "sent": "выдан",
+        "failed": "ошибка выдачи",
+    }
+    text = _payment_admin_message(
+        deal_id=row["deal_id"],
+        product_slug=row["product_slug"],
+        email=row["email"],
+        phone=row["phone"],
+        amount_rub=row["amount_rub"],
+        payment_at_utc=row["payment_at"],
+        access_status=status_map.get(row["delivery_status"], row["delivery_status"] or "-"),
+        delivered_at_utc=row["delivered_at"],
+        joined_at_utc=row["joined_at"],
+        telegram_user_id=row["telegram_user_id"],
+        telegram_username=row["telegram_username"],
+    )
+    _tg_upsert_admin_message(_admin_payment_key(deal_id), text)
+
+
+def _refresh_clicks_admin_message(product_slug: str) -> None:
+    product = PRODUCTS.get(product_slug, {})
+    stats = _stats_since(_local_day_start_utc(0))
+    text = "\n".join([
+        f"<b>Клики · {html.escape(product.get('name', product_slug))}</b>",
+        "",
+        f"Дата: {_local_now().strftime('%d.%m.%Y')} {REPORT_TZ_LABEL}",
+        _fmt_stats_line(stats),
+        f"Обновлено: {_local_now().strftime('%H:%M')} {REPORT_TZ_LABEL}",
+    ])
+    _tg_upsert_admin_message(_today_key(f"clicks:{product_slug}"), text)
+
+
+def _record_telegram_join(update: dict) -> bool:
+    chat_member = update.get("chat_member") or {}
+    new_member = chat_member.get("new_chat_member") or {}
+    status = new_member.get("status")
+    if status not in {"member", "administrator", "creator"}:
+        return False
+    user = new_member.get("user") or {}
+    if user.get("is_bot"):
+        return False
+    invite = chat_member.get("invite_link") or {}
+    invite_link = invite.get("invite_link")
+    invite_name = invite.get("name") or ""
+    if not invite_link and not invite_name.startswith("order-"):
+        return False
+
+    with _db() as conn:
+        row = None
+        if invite_link:
+            row = conn.execute(
+                """
+                SELECT deal_id, product_slug, email, invite_link
+                FROM deliveries
+                WHERE invite_link=?
+                UNION ALL
+                SELECT deal_id, product_slug, email, invite_link
+                FROM buyers
+                WHERE invite_link=?
+                LIMIT 1
+                """,
+                (invite_link, invite_link),
+            ).fetchone()
+        if not row and invite_name.startswith("order-"):
+            deal_prefix = invite_name.removeprefix("order-")
+            row = conn.execute(
+                """
+                SELECT deal_id, product_slug, email, invite_link
+                FROM deliveries
+                WHERE deal_id LIKE ?
+                UNION ALL
+                SELECT deal_id, product_slug, email, invite_link
+                FROM buyers
+                WHERE deal_id LIKE ?
+                LIMIT 1
+                """,
+                (f"{deal_prefix}%", f"{deal_prefix}%"),
+            ).fetchone()
+        if not row:
+            return False
+
+        full_name = " ".join(part for part in [user.get("first_name"), user.get("last_name")] if part).strip()
+        conn.execute(
+            """
+            INSERT INTO telegram_joins
+                (deal_id, product_slug, email, telegram_user_id, telegram_username, telegram_name, invite_link, joined_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(deal_id) DO UPDATE SET
+                telegram_user_id=excluded.telegram_user_id,
+                telegram_username=excluded.telegram_username,
+                telegram_name=excluded.telegram_name,
+                invite_link=excluded.invite_link,
+                joined_at=excluded.joined_at,
+                updated_at=datetime('now')
+            """,
+            (
+                row["deal_id"],
+                row["product_slug"],
+                row["email"],
+                int(user["id"]),
+                user.get("username"),
+                full_name or None,
+                invite_link or row["invite_link"],
+            ),
+        )
+        deal_id = row["deal_id"]
+    log.info(
+        "TELEGRAM_JOIN: order=%s email=%s tg_user_id=%s username=%s invite=%s",
+        deal_id,
+        row["email"],
+        user.get("id"),
+        user.get("username"),
+        invite_link or invite_name,
+    )
+    _request_s3_backup("telegram join")
+    _refresh_payment_admin_message(deal_id)
+    return True
+
+
 # ─────────────────────────── delivery queue ───────────────────────────
 
 def _enqueue_delivery(order_id: str, slug: str, email: str, phone: str | None, amount_rub: float | None) -> str:
@@ -1010,6 +1330,7 @@ def _enqueue_delivery(order_id: str, slug: str, email: str, phone: str | None, a
     status = row["status"] if row else "unknown"
     log.info("DELIVERY_QUEUED: order=%s product=%s email=%s phone=%s amount_rub=%s status=%s", order_id, slug, email, phone, amount_rub, status)
     _request_s3_backup("delivery queued")
+    _refresh_payment_admin_message(order_id)
     return status
 
 
@@ -1126,12 +1447,7 @@ def _finish_delivery(row: dict, invite_link: str) -> None:
         row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], invite_link,
     )
     _request_s3_backup("delivery sent")
-    _tg_notify_admin(
-        f"✅ <b>Оплата «{html.escape(PRODUCTS[row['product_slug']]['name'])}»</b>\n"
-        f"Email: <code>{html.escape(_mask_email(row['email']))}</code>\n"
-        f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
-        f"Доступ отправлен"
-    )
+    _refresh_payment_admin_message(row["deal_id"])
 
 
 def _fail_or_retry_delivery(row: dict, exc: Exception) -> None:
@@ -1179,8 +1495,9 @@ def _fail_or_retry_delivery(row: dict, exc: Exception) -> None:
             row["deal_id"], row["product_slug"], row["email"], row["phone"], row["amount_rub"], attempts, error,
         )
         _send_manual_access_email_best_effort(row)
+        _refresh_payment_admin_message(row["deal_id"])
         _tg_notify_admin(
-            f"🔴 <b>Доступ не отправлен</b>\n"
+            f"<b>Доступ не отправлен</b>\n"
             f"Email: <code>{html.escape(_mask_email(row['email']))}</code>\n"
             f"Заказ: <code>{html.escape(row['deal_id'])}</code>\n"
             f"Проверь логи DELIVERY_FAILED"
@@ -1454,16 +1771,16 @@ def create_payment_for(slug: str):
         form_url, deal_id = _gpl_init_payment(request.host_url, slug, product)
     except Exception as exc:
         log.exception("create-payment(%s): GPL init failed: %s", slug, exc)
-        _tg_notify_admin(f"🔴 <b>GPL init failed</b>\n{html.escape(product['name'])}\n{html.escape(_safe_log_text(exc)[:200])}")
+        _tg_notify_admin(f"<b>GPL init failed</b>\n{html.escape(product['name'])}\n{html.escape(_safe_log_text(exc)[:200])}")
         return redirect(product["fail_url"], code=302)
     if not form_url:
         log.error("create-payment(%s): no formUrl in GPL response", slug)
-        _tg_notify_admin(f"🔴 <b>GPL не вернул formUrl</b>\n{html.escape(product['name'])}")
+        _tg_notify_admin(f"<b>GPL не вернул formUrl</b>\n{html.escape(product['name'])}")
         return redirect(product["fail_url"], code=302)
     parsed = urlparse(form_url)
     if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".getplatinum.ru"):
         log.error("create-payment(%s): suspicious formUrl %s — refusing redirect", slug, form_url)
-        _tg_notify_admin(f"🔴 <b>Подозрительный formUrl от GPL</b>\n{html.escape(form_url[:200])}")
+        _tg_notify_admin(f"<b>Подозрительный formUrl от GPL</b>\n{html.escape(form_url[:200])}")
         return redirect(product["fail_url"], code=302)
     log.info("CONSENT_ORDER: %s", json.dumps({
         "order": deal_id,
@@ -1490,10 +1807,7 @@ def create_payment_for(slug: str):
     except Exception as exc:
         log.exception("Failed to record order %s in DB: %s", deal_id, exc)
         # Не валим оплату из-за БД — fallback по customParams.product сработает.
-    _tg_notify_admin(
-        f"🟡 <b>Клик «{html.escape(product['name'])}»</b>\n"
-        f"Сумма: {product['price_rub']} ₽"
-    )
+    _refresh_clicks_admin_message(slug)
     return redirect(form_url, code=302)
 
 
@@ -1528,7 +1842,7 @@ def payment_callback(callback_token: str | None = None):
         else:
             log.warning("Rejected callback with bad token for order %s", order_id)
             _tg_notify_admin(
-                f"🔴 <b>Отклонён callback без защиты</b>\n"
+                f"<b>Отклонён callback без защиты</b>\n"
                 f"Заказ: <code>{html.escape(order_id)}</code>\n"
                 f"Доступ не выдавался"
             )
@@ -1545,13 +1859,13 @@ def payment_callback(callback_token: str | None = None):
     slug, product = _resolve_product(order_id, body)
     if not product:
         log.error("Cannot resolve product for order %s — body=%s", order_id, body)
-        _tg_notify_admin(f"🔴 <b>Неизвестный продукт в callback</b>\nЗаказ: <code>{html.escape(order_id)}</code>")
+        _tg_notify_admin(f"<b>Неизвестный продукт в callback</b>\nЗаказ: <code>{html.escape(order_id)}</code>")
         return jsonify({"ok": True, "skipped": "unknown_product"}), 200
 
     email = _extract_email(body)
     if not email:
         log.error("No email in callback for order %s — body=%s", order_id, body)
-        _tg_notify_admin(f"🔴 <b>Нет email в callback</b>\nЗаказ: <code>{html.escape(order_id)}</code>\nПродукт: {html.escape(slug)}")
+        _tg_notify_admin(f"<b>Нет email в callback</b>\nЗаказ: <code>{html.escape(order_id)}</code>\nПродукт: {html.escape(slug)}")
         return jsonify({"ok": True, "skipped": "no_email"}), 200
 
     phone = _extract_phone(body)
@@ -1560,20 +1874,27 @@ def payment_callback(callback_token: str | None = None):
     if amount_rub is not None and amount_rub + 0.01 < product["price_rub"]:
         log.error("Callback underpaid for order %s: amount_rub=%s expected=%s", order_id, amount_rub, product["price_rub"])
         _tg_notify_admin(
-            f"🔴 <b>Отклонён callback с неверной суммой</b>\n"
+            f"<b>Отклонён callback с неверной суммой</b>\n"
             f"Заказ: <code>{html.escape(order_id)}</code>\n"
             f"Сумма: {html.escape(str(amount_rub))} ₽ вместо {product['price_rub']} ₽"
         )
         return jsonify({"ok": True, "skipped": "amount_mismatch"}), 200
 
     delivery_status = _enqueue_delivery(order_id, slug, email, phone, amount_rub)
-    _tg_notify_admin(
-        f"💰 <b>Получена оплата «{html.escape(product['name'])}»</b>\n"
-        f"Email: <code>{html.escape(_mask_email(email))}</code>\n"
-        f"Заказ: <code>{html.escape(order_id)}</code>\n"
-        f"Выдаю доступ…"
-    )
     return jsonify({"ok": True, "delivery": delivery_status}), 200
+
+
+@app.route("/telegram-webhook/<secret>", methods=["POST"])
+def telegram_webhook(secret: str):
+    if not TG_WEBHOOK_SECRET or not hmac.compare_digest(secret, TG_WEBHOOK_SECRET):
+        abort(404)
+    update = request.get_json(silent=True) or {}
+    try:
+        handled = _record_telegram_join(update)
+        return jsonify({"ok": True, "handled": handled}), 200
+    except Exception as exc:
+        log.warning("Telegram webhook handling failed: %s", _safe_log_text(exc))
+        return jsonify({"ok": True, "handled": False}), 200
 
 
 @app.route("/health", methods=["GET"])
