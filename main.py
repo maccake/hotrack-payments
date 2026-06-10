@@ -725,6 +725,16 @@ def _tg_upsert_admin_message(message_key: str, text: str) -> int | None:
     return message_id
 
 
+def _run_best_effort_async(name: str, target, *args) -> None:
+    def _runner():
+        try:
+            target(*args)
+        except Exception as exc:
+            log.warning("%s failed (non-critical): %s", name, _safe_log_text(exc))
+
+    threading.Thread(target=_runner, name=name, daemon=True).start()
+
+
 def _local_now() -> datetime:
     return datetime.now(REPORT_TZ)
 
@@ -1338,7 +1348,7 @@ def _enqueue_delivery(order_id: str, slug: str, email: str, phone: str | None, a
     status = row["status"] if row else "unknown"
     log.info("DELIVERY_QUEUED: order=%s product=%s email=%s phone=%s amount_rub=%s status=%s", order_id, slug, email, phone, amount_rub, status)
     _request_s3_backup("delivery queued")
-    _refresh_payment_admin_message(order_id)
+    _run_best_effort_async("admin-payment-refresh", _refresh_payment_admin_message, order_id)
     return status
 
 
@@ -1815,7 +1825,7 @@ def create_payment_for(slug: str):
     except Exception as exc:
         log.exception("Failed to record order %s in DB: %s", deal_id, exc)
         # Не валим оплату из-за БД — fallback по customParams.product сработает.
-    _refresh_clicks_admin_message(slug)
+    _run_best_effort_async("admin-clicks-refresh", _refresh_clicks_admin_message, slug)
     return redirect(form_url, code=302)
 
 
