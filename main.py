@@ -86,11 +86,7 @@ S3_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("S3_CONNECT_TIMEOUT_SECONDS", "5
 S3_READ_TIMEOUT_SECONDS = int(os.environ.get("S3_READ_TIMEOUT_SECONDS", "10"))
 S3_BACKUP_ENCRYPTION_KEY = os.environ.get("S3_BACKUP_ENCRYPTION_KEY", "").strip()
 CALLBACK_TOKEN_GRACE_SECONDS = int(os.environ.get("CALLBACK_TOKEN_GRACE_SECONDS", "86400"))
-TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "").strip() or hmac.new(
-    GPL_API_KEY.encode("utf-8"),
-    b"telegram-webhook-v1",
-    hashlib.sha256,
-).hexdigest()[:48]
+TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "").strip()
 
 REPORT_TZ = timezone(timedelta(hours=3))
 REPORT_TZ_LABEL = "МСК"
