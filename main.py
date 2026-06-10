@@ -86,11 +86,15 @@ S3_CONNECT_TIMEOUT_SECONDS = int(os.environ.get("S3_CONNECT_TIMEOUT_SECONDS", "5
 S3_READ_TIMEOUT_SECONDS = int(os.environ.get("S3_READ_TIMEOUT_SECONDS", "10"))
 S3_BACKUP_ENCRYPTION_KEY = os.environ.get("S3_BACKUP_ENCRYPTION_KEY", "").strip()
 CALLBACK_TOKEN_GRACE_SECONDS = int(os.environ.get("CALLBACK_TOKEN_GRACE_SECONDS", "86400"))
-TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "").strip() or hmac.new(
+TG_WEBHOOK_FALLBACK_SECRET = hmac.new(
     GPL_API_KEY.encode("utf-8"),
     b"telegram-webhook-v1",
     hashlib.sha256,
 ).hexdigest()[:48]
+TG_WEBHOOK_SECRET = os.environ.get("TG_WEBHOOK_SECRET", "").strip()
+TG_WEBHOOK_SECRETS = {TG_WEBHOOK_FALLBACK_SECRET}
+if TG_WEBHOOK_SECRET:
+    TG_WEBHOOK_SECRETS.add(TG_WEBHOOK_SECRET)
 
 REPORT_TZ = timezone(timedelta(hours=3))
 REPORT_TZ_LABEL = "МСК"
@@ -1890,7 +1894,7 @@ def payment_callback(callback_token: str | None = None):
 
 @app.route("/telegram-webhook/<secret>", methods=["POST"])
 def telegram_webhook(secret: str):
-    if not TG_WEBHOOK_SECRET or not hmac.compare_digest(secret, TG_WEBHOOK_SECRET):
+    if not any(hmac.compare_digest(secret, allowed) for allowed in TG_WEBHOOK_SECRETS):
         abort(404)
     update = request.get_json(silent=True) or {}
     try:
