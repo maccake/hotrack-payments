@@ -59,7 +59,10 @@ CONSENT_TEXT = os.environ.get(
 # Опциональные — для админ-нотификаций и /stats. Если не заданы — функционал просто выключен.
 ADMIN_BOT_TOKEN = os.environ.get("ADMIN_BOT_TOKEN")
 ADMIN_CHAT_ID_RAW = os.environ.get("ADMIN_CHAT_ID")  # numeric id приватного канала/группы куда слать сводку
-STATS_TOKEN = os.environ.get("STATS_TOKEN")      # секрет в URL для просмотра статистики
+STATS_TOKEN = os.environ.get("STATS_TOKEN")      # секрет в URL для просмотра статистики (legacy)
+# Админ-панель /stats: Basic Auth. Если логин ИЛИ пароль не заданы — панель выключена (404).
+ADMIN_PANEL_USER = os.environ.get("ADMIN_PANEL_USER")
+ADMIN_PANEL_PASSWORD = os.environ.get("ADMIN_PANEL_PASSWORD")
 
 # Telegram API по умолчанию вызываем напрямую. Прокси включается только явным TG_PROXY_ENABLED=1,
 # чтобы старый нерабочий TG_PROXY_URL в TimeWeb не задерживал delivery.
@@ -1574,6 +1577,101 @@ def payment_callback(callback_token: str | None = None):
         f"Выдаю доступ…"
     )
     return jsonify({"ok": True, "delivery": delivery_status}), 200
+
+
+def _admin_auth_ok() -> bool:
+    """Basic Auth для /stats. Сравнение постоянное по времени, оба поля проверяем всегда."""
+    auth = request.authorization
+    if not auth or (auth.type or "").lower() != "basic":
+        return False
+    user_ok = hmac.compare_digest(auth.username or "", ADMIN_PANEL_USER or "")
+    pass_ok = hmac.compare_digest(auth.password or "", ADMIN_PANEL_PASSWORD or "")
+    return user_ok and pass_ok
+
+
+@app.route("/stats", methods=["GET"])
+@limiter.limit("30 per minute")
+def stats():
+    """Админ-панель: сводка + последние покупатели со ссылками. Защита — Basic Auth."""
+    # Панель выключена пока не заданы оба креда. 404 — не палим, что эндпоинт существует.
+    if not ADMIN_PANEL_USER or not ADMIN_PANEL_PASSWORD:
+        abort(404)
+    if not _admin_auth_ok():
+        # 401 + WWW-Authenticate — браузер покажет окно логина.
+        return ("Требуется авторизация", 401, {"WWW-Authenticate": 'Basic realm="stats", charset="UTF-8"'})
+
+    periods = [
+        ("сегодня", "datetime('now', 'start of day')"),
+        ("неделя", "datetime('now', '-7 days')"),
+        ("месяц", "datetime('now', '-30 days')"),
+        ("всё время", "datetime('1970-01-01')"),
+    ]
+    rows = []
+    with _db() as conn:
+        for label, since in periods:
+            clicks = conn.execute(f"SELECT COUNT(*) FROM orders WHERE created_at >= {since}").fetchone()[0]
+            buyers = conn.execute(f"SELECT COUNT(*) FROM buyers WHERE completed_at >= {since}").fetchone()[0]
+            revenue = conn.execute(f"SELECT COALESCE(SUM(amount_rub), 0) FROM buyers WHERE completed_at >= {since}").fetchone()[0]
+            conv = (buyers / clicks * 100) if clicks else 0
+            rows.append({"period": label, "clicks": clicks, "buyers": buyers, "revenue": revenue, "conversion_pct": round(conv, 1)})
+        by_product = conn.execute(
+            "SELECT product_slug, COUNT(*) AS n, COALESCE(SUM(amount_rub), 0) AS revenue FROM buyers GROUP BY product_slug ORDER BY n DESC"
+        ).fetchall()
+        latest = conn.execute(
+            "SELECT product_slug, email, phone, invite_link, amount_rub, completed_at "
+            "FROM buyers ORDER BY completed_at DESC LIMIT 50"
+        ).fetchall()
+
+    def _product_name(slug: str) -> str:
+        product = PRODUCTS.get(slug)
+        return product["name"] if product else slug
+
+    if request.args.get("format") == "json":
+        return jsonify({
+            "summary": rows,
+            "by_product": [dict(r) for r in by_product],
+            "latest": [dict(r) for r in latest],
+        })
+
+    # HTML-вид (по умолчанию) — открывается в браузере.
+    h = ['<!doctype html><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>Покупатели</title>',
+         '<style>body{font-family:sans-serif;max-width:920px;margin:24px auto;padding:0 16px;color:#222}',
+         'table{border-collapse:collapse;width:100%;margin-bottom:24px}',
+         'th,td{padding:8px 10px;border-bottom:1px solid #ddd;text-align:left;font-size:14px;vertical-align:top}',
+         'th{background:#f4f4f4;font-weight:600}',
+         'a.invite{font-family:monospace;font-size:12px;word-break:break-all}',
+         'h1{font-size:22px}h2{font-size:16px;margin-top:32px}</style>',
+         '<h1>📊 Платёжная статистика</h1>',
+         '<h2>Сводка</h2><table><tr><th>Период</th><th>Кликов</th><th>Оплат</th><th>Конверсия</th><th>Выручка ₽</th></tr>']
+    for r in rows:
+        h.append(f"<tr><td>{r['period']}</td><td>{r['clicks']}</td><td>{r['buyers']}</td>"
+                 f"<td>{r['conversion_pct']}%</td><td>{r['revenue']:.0f}</td></tr>")
+    h.append('</table>')
+    if by_product:
+        h.append('<h2>По продуктам (всё время)</h2><table><tr><th>Продукт</th><th>Покупок</th><th>Выручка ₽</th></tr>')
+        for r in by_product:
+            h.append(f"<tr><td>{html.escape(_product_name(r['product_slug']))}</td><td>{r['n']}</td><td>{r['revenue']:.0f}</td></tr>")
+        h.append('</table>')
+    if latest:
+        h.append('<h2>Последние 50 покупателей</h2>'
+                 '<table><tr><th>Когда</th><th>Продукт</th><th>Email</th><th>Телефон</th><th>₽</th><th>Ссылка</th></tr>')
+        for r in latest:
+            invite = r["invite_link"]
+            if invite:
+                safe = html.escape(invite)
+                link_cell = f'<a class="invite" href="{safe}">{safe}</a>'
+            else:
+                link_cell = '<span style="color:#c00">—</span>'
+            h.append(f"<tr><td>{html.escape(r['completed_at'])}</td>"
+                     f"<td>{html.escape(_product_name(r['product_slug']))}</td>"
+                     f"<td>{html.escape(r['email'])}</td>"
+                     f"<td>{html.escape(r['phone'] or '—')}</td>"
+                     f"<td>{(r['amount_rub'] or 0):.0f}</td>"
+                     f"<td>{link_cell}</td></tr>")
+        h.append('</table>')
+    h.append('<p style="color:#888;font-size:12px;margin-top:32px">База бэкапится в S3 и восстанавливается после деплоя. '
+             'Полная история покупателей также пишется в лог строкой <code>BUYER:</code>.</p>')
+    return "".join(h), 200, {"Content-Type": "text/html; charset=utf-8"}
 
 
 @app.route("/health", methods=["GET"])
